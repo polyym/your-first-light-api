@@ -97,7 +97,7 @@ The rate limiter is in-memory and per-process. It does not synchronise across mu
 
 By default the limiter keys on the direct peer address and ignores forwarding headers, because on a directly exposed port they are entirely attacker-supplied (varying `X-Forwarded-For` would mint a fresh rate-limit bucket per request). Two settings adapt this to a deployment:
 
-- `CLIENT_IP_HEADER`: the name of a header your platform's edge sets to the verified caller address as a single value. Render fronts every service with Cloudflare and provides `True-Client-IP`, so `render.yaml` sets `CLIENT_IP_HEADER=True-Client-IP`. This takes precedence, because platform chains (Cloudflare plus internal hops on Render) contain a variable number of entries and no fixed hop count is reliable.
+- `CLIENT_IP_HEADER`: the name of a header your platform's edge sets to the verified caller address as a single value. On Render this defaults to `True-Client-IP` automatically (detected via the platform's `RENDER` environment variable), because Render fronts every service with Cloudflare and its proxy chain contains a variable number of hops, making any fixed hop count unreliable. Set it explicitly for other platforms (`CF-Connecting-IP`, `Fly-Client-IP`). This takes precedence over the hop count.
 - `TRUSTED_PROXY_HOPS`: for a conventional reverse-proxy chain without such a header, set the number of trusted hops; the limiter uses the `X-Forwarded-For` entry appended by the first trusted proxy and never anything further left.
 
 ## Local development

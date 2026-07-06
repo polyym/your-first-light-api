@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Your First Light",
     description="Post your birthday. Discover your cosmic reach.",
-    version="1.1.1",
+    version="1.1.2",
 )
 
 # NOTE: CORSMiddleware is registered at the bottom of this module,
@@ -147,11 +147,30 @@ async def validation_exception_handler(
 # Cloudflare), "CF-Connecting-IP" behind Cloudflare directly, or
 # "Fly-Client-IP" on Fly.io.  Takes precedence over the hop-count
 # logic below because platform chains can contain a variable
-# number of internal hops.  Leave empty when no such header
-# exists.
-CLIENT_IP_HEADER = os.environ.get(
-    "CLIENT_IP_HEADER", "",
-).strip()
+# number of internal hops.
+def _resolve_client_ip_header() -> str:
+    """Determine which platform identity header to trust.
+
+    An explicit ``CLIENT_IP_HEADER`` always wins.  Otherwise,
+    when the ``RENDER`` variable is present (Render sets it on
+    every service), default to ``True-Client-IP``: Render fronts
+    all services with Cloudflare and controls that header, and
+    services created outside a blueprint never receive the env
+    vars declared in render.yaml, so the safe default must not
+    depend on manual configuration.
+
+    Returns:
+        Header name, or ``""`` when no platform header applies.
+    """
+    configured = os.environ.get("CLIENT_IP_HEADER", "").strip()
+    if configured:
+        return configured
+    if os.environ.get("RENDER"):
+        return "True-Client-IP"
+    return ""
+
+
+CLIENT_IP_HEADER = _resolve_client_ip_header()
 
 # Number of trusted reverse proxies between the client and this
 # app.  0 (the default) means the port is directly exposed and

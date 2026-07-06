@@ -245,3 +245,33 @@ class TestPlatformIdentityHeader:
         resp = client.post(_BIG, json=_ENDPOINT_PAYLOADS[_BIG])
         assert resp.status_code == 200
         assert "testclient" in _rate_limit
+
+
+class TestClientIpHeaderResolution:
+    """The platform header must not depend on manual config."""
+
+    def test_explicit_setting_wins(self, monkeypatch):
+        monkeypatch.setenv("CLIENT_IP_HEADER", "Fly-Client-IP")
+        monkeypatch.setenv("RENDER", "true")
+        assert (
+            app_module._resolve_client_ip_header()
+            == "Fly-Client-IP"
+        )
+
+    def test_render_defaults_to_true_client_ip(
+        self, monkeypatch,
+    ):
+        """Render sets RENDER=true on every service; the header
+        default must activate even when render.yaml env vars
+        were never applied (manually created service)."""
+        monkeypatch.delenv("CLIENT_IP_HEADER", raising=False)
+        monkeypatch.setenv("RENDER", "true")
+        assert (
+            app_module._resolve_client_ip_header()
+            == "True-Client-IP"
+        )
+
+    def test_no_platform_no_header(self, monkeypatch):
+        monkeypatch.delenv("CLIENT_IP_HEADER", raising=False)
+        monkeypatch.delenv("RENDER", raising=False)
+        assert app_module._resolve_client_ip_header() == ""

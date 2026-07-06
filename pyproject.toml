@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "your-first-light"
-version = "1.1.1"
+version = "1.1.2"
 description = "Post your birthday. Discover your cosmic reach."
 requires-python = ">=3.13"
 dependencies = [

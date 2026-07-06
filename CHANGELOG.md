@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.2
+
+- `CLIENT_IP_HEADER` now defaults to `True-Client-IP` automatically when the app detects it is running on Render (via the platform-set `RENDER` environment variable). Live verification of 1.1.1 showed that services created outside a blueprint never receive the env vars declared in `render.yaml`, so rate limiting kept keying on Render's rotating internal proxy addresses; the safe default removes any dependence on manual dashboard configuration. An explicit `CLIENT_IP_HEADER` still takes precedence.
+
 ## 1.1.1
 
 - Fixed client IP extraction on Render, where live testing showed the rate limiter never engaging. Render fronts every service with Cloudflare, so the `X-Forwarded-For` chain contains a variable number of platform hops and the fixed `TRUSTED_PROXY_HOPS=1` selected a proxy address that changed on every request, giving each request a fresh rate-limit bucket. A new `CLIENT_IP_HEADER` setting reads the verified caller address from a platform-set header instead, taking precedence over the hop-count logic; `render.yaml` now sets `CLIENT_IP_HEADER=True-Client-IP`. `TRUSTED_PROXY_HOPS` remains available for deployments behind a conventional proxy chain.
