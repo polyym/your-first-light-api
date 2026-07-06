@@ -95,7 +95,10 @@ The rate limiter is in-memory and per-process. It does not synchronise across mu
 
 ### Client IP extraction behind a proxy
 
-By default the limiter keys on the direct peer address and ignores `X-Forwarded-For`, because on a directly exposed port that header is entirely attacker-supplied (varying it would mint a fresh rate-limit bucket per request). When the app runs behind one or more trusted reverse proxies, set the `TRUSTED_PROXY_HOPS` environment variable to the number of proxy hops; the limiter then uses the `X-Forwarded-For` entry appended by the first trusted proxy and never anything further left. `render.yaml` sets `TRUSTED_PROXY_HOPS=1` for Render.
+By default the limiter keys on the direct peer address and ignores forwarding headers, because on a directly exposed port they are entirely attacker-supplied (varying `X-Forwarded-For` would mint a fresh rate-limit bucket per request). Two settings adapt this to a deployment:
+
+- `CLIENT_IP_HEADER`: the name of a header your platform's edge sets to the verified caller address as a single value. Render fronts every service with Cloudflare and provides `True-Client-IP`, so `render.yaml` sets `CLIENT_IP_HEADER=True-Client-IP`. This takes precedence, because platform chains (Cloudflare plus internal hops on Render) contain a variable number of entries and no fixed hop count is reliable.
+- `TRUSTED_PROXY_HOPS`: for a conventional reverse-proxy chain without such a header, set the number of trusted hops; the limiter uses the `X-Forwarded-For` entry appended by the first trusted proxy and never anything further left.
 
 ## Local development
 

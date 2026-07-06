@@ -9,7 +9,11 @@ services:
       # best-effort detection; the Dockerfile CMD reads it.
       - key: PORT
         value: "8000"
-      # Render terminates TLS and proxies requests, so trust
-      # one X-Forwarded-For hop when extracting client IPs.
-      - key: TRUSTED_PROXY_HOPS
-        value: "1"
+      # Render fronts every service with Cloudflare and sets
+      # True-Client-IP to the verified caller address. The
+      # X-Forwarded-For chain contains a variable number of
+      # platform hops here, so a fixed hop count is unreliable;
+      # the platform header is the supported way to identify
+      # callers.
+      - key: CLIENT_IP_HEADER
+        value: "True-Client-IP"

@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.1
+
+- Fixed client IP extraction on Render, where live testing showed the rate limiter never engaging. Render fronts every service with Cloudflare, so the `X-Forwarded-For` chain contains a variable number of platform hops and the fixed `TRUSTED_PROXY_HOPS=1` selected a proxy address that changed on every request, giving each request a fresh rate-limit bucket. A new `CLIENT_IP_HEADER` setting reads the verified caller address from a platform-set header instead, taking precedence over the hop-count logic; `render.yaml` now sets `CLIENT_IP_HEADER=True-Client-IP`. `TRUSTED_PROXY_HOPS` remains available for deployments behind a conventional proxy chain.
+
 ## 1.1.0
 
 A quality and automation release. The client contract is unchanged: no endpoint paths, request fields, response field names or types, or status codes for existing valid cases have been altered. The values inside some existing fields have changed where that is a correctness fix, and a handful of purely additive fields and routes are new.

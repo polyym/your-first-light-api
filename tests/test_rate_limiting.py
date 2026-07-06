@@ -178,3 +178,70 @@ class TestProxyIP:
         )
         assert resp.status_code == 200
         assert "203.0.113.5" in _rate_limit
+
+
+class TestPlatformIdentityHeader:
+    """CLIENT_IP_HEADER: the platform-set verified caller address.
+
+    On Render the X-Forwarded-For chain contains a variable
+    number of Cloudflare and internal hops, so the limiter reads
+    the platform's True-Client-IP header instead.
+    """
+
+    def test_platform_header_keys_the_limiter(
+        self, client, monkeypatch,
+    ):
+        monkeypatch.setattr(
+            app_module, "CLIENT_IP_HEADER", "True-Client-IP",
+        )
+        payload = _ENDPOINT_PAYLOADS[_BIG]
+        resp1 = client.post(
+            _BIG, json=payload,
+            headers={"True-Client-IP": "81.97.145.24"},
+        )
+        assert resp1.status_code == 200
+        assert "81.97.145.24" in _rate_limit
+
+        resp2 = client.post(
+            _BIG, json=payload,
+            headers={"True-Client-IP": "81.97.145.24"},
+        )
+        assert resp2.status_code == 429
+
+        resp3 = client.post(
+            _BIG, json=payload,
+            headers={"True-Client-IP": "203.0.113.9"},
+        )
+        assert resp3.status_code == 200
+
+    def test_platform_header_beats_hop_count(
+        self, client, monkeypatch,
+    ):
+        """When both are configured, the platform header wins:
+        the X-Forwarded-For chain is what it exists to avoid."""
+        monkeypatch.setattr(
+            app_module, "CLIENT_IP_HEADER", "True-Client-IP",
+        )
+        monkeypatch.setattr(app_module, "TRUSTED_PROXY_HOPS", 1)
+        resp = client.post(
+            _BIG, json=_ENDPOINT_PAYLOADS[_BIG],
+            headers={
+                "True-Client-IP": "81.97.145.24",
+                "X-Forwarded-For": "9.9.9.9, 172.71.195.123",
+            },
+        )
+        assert resp.status_code == 200
+        assert "81.97.145.24" in _rate_limit
+        assert "172.71.195.123" not in _rate_limit
+
+    def test_missing_platform_header_falls_back(
+        self, client, monkeypatch,
+    ):
+        """A request without the configured header falls back to
+        the remaining resolution order rather than failing."""
+        monkeypatch.setattr(
+            app_module, "CLIENT_IP_HEADER", "True-Client-IP",
+        )
+        resp = client.post(_BIG, json=_ENDPOINT_PAYLOADS[_BIG])
+        assert resp.status_code == 200
+        assert "testclient" in _rate_limit

@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Your First Light",
     description="Post your birthday. Discover your cosmic reach.",
-    version="1.1.0",
+    version="1.1.1",
 )
 
 # NOTE: CORSMiddleware is registered at the bottom of this module,
@@ -141,10 +141,22 @@ async def validation_exception_handler(
 # -------------------------------------------------------------------
 # Client IP extraction (proxy-aware, opt-in)
 # -------------------------------------------------------------------
+# Name of a request header that the hosting platform's edge sets
+# to the verified client address as a single value, e.g.
+# "True-Client-IP" on Render (which fronts every service with
+# Cloudflare), "CF-Connecting-IP" behind Cloudflare directly, or
+# "Fly-Client-IP" on Fly.io.  Takes precedence over the hop-count
+# logic below because platform chains can contain a variable
+# number of internal hops.  Leave empty when no such header
+# exists.
+CLIENT_IP_HEADER = os.environ.get(
+    "CLIENT_IP_HEADER", "",
+).strip()
+
 # Number of trusted reverse proxies between the client and this
 # app.  0 (the default) means the port is directly exposed and
 # X-Forwarded-For is entirely attacker-supplied, so it is ignored
-# and the direct peer address is used.  Behind Render or another
+# and the direct peer address is used.  Behind a conventional
 # proxy chain, set TRUSTED_PROXY_HOPS to the number of proxy hops
 # so the entry appended by the first trusted proxy is selected.
 TRUSTED_PROXY_HOPS = int(
@@ -155,14 +167,20 @@ TRUSTED_PROXY_HOPS = int(
 def _get_client_ip(request: Request) -> str:
     """Extract the client IP used for rate limiting and logging.
 
-    With ``TRUSTED_PROXY_HOPS`` set to N > 0, each of the N
-    trusted proxies appends the address of the peer it accepted,
-    so the real client is the Nth entry from the right of
-    ``X-Forwarded-For``.  Anything further left is
-    client-supplied and trivially spoofable, so it is never
-    consulted.  With the default of 0 the header is ignored
-    completely, because a directly exposed port makes the whole
-    header attacker-controlled.
+    Resolution order:
+
+    1. ``CLIENT_IP_HEADER``, when configured and present: the
+       platform edge sets this to the verified caller address,
+       which is reliable even when the platform's own proxy
+       chain has a variable number of hops (as on Render).
+    2. ``TRUSTED_PROXY_HOPS`` set to N > 0: each of the N
+       trusted proxies appends the address of the peer it
+       accepted, so the real client is the Nth entry from the
+       right of ``X-Forwarded-For``.  Anything further left is
+       client-supplied and trivially spoofable, so it is never
+       consulted.
+    3. Otherwise the direct peer address; forwarding headers on
+       a directly exposed port are attacker-controlled.
 
     Args:
         request: The incoming HTTP request.
@@ -170,6 +188,12 @@ def _get_client_ip(request: Request) -> str:
     Returns:
         Client IP string, or ``"unknown"`` when unavailable.
     """
+    if CLIENT_IP_HEADER:
+        value = request.headers.get(CLIENT_IP_HEADER)
+        if value:
+            # Platform identity headers carry a single address;
+            # take the first token defensively regardless.
+            return value.split(",")[0].strip()
     hops = TRUSTED_PROXY_HOPS
     if hops > 0:
         forwarded = request.headers.get("x-forwarded-for")
