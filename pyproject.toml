@@ -4,19 +4,25 @@ build-backend = "hatchling.build"
 
 [project]
 name = "your-first-light"
-version = "1.0.0"
+version = "1.1.0"
 description = "Post your birthday. Discover your cosmic reach."
 requires-python = ">=3.13"
 dependencies = [
     "fastapi>=0.135.3,<0.136.0",
     "uvicorn>=0.44.0,<0.45.0",
     "astropy>=7.2.0,<7.3.0",
+    # Imported directly (src/models.py, src/compute.py), so
+    # declared explicitly rather than relied on transitively.
+    "pydantic>=2.7,<3",
+    "pyerfa>=2.0.1",
 ]
 
 [project.optional-dependencies]
 dev = [
     "httpx>=0.27",
     "pytest>=8.0",
+    "ruff>=0.15",
+    "mypy>=1.14",
 ]
 catalogue = [
     "astroquery>=0.4.11",
@@ -44,3 +50,10 @@ select = ["E", "F", "I", "W"]
 [tool.mypy]
 python_version = "3.13"
 strict = true
+files = ["src"]
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+# astropy and pyerfa ship no type stubs or py.typed marker.
+module = ["astropy.*", "erfa"]
+ignore_missing_imports = true

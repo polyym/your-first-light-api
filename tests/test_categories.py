@@ -16,11 +16,11 @@ class TestIndividualCategories:
         data = resp.json()
         assert "eclipses" in data
         ec = data["eclipses"]
-        assert ec["solar_eclipses"] > 0
-        assert ec["lunar_eclipses"] > 0
-        assert ec["total_eclipses"] == (
-            ec["solar_eclipses"] + ec["lunar_eclipses"]
-        )
+        # Exact counts for 2000-01-01..2025-01-01; the catalogue
+        # is checked in, so these are stable.
+        assert ec["solar_eclipses"] == 56
+        assert ec["lunar_eclipses"] == 57
+        assert ec["total_eclipses"] == 113
 
     def test_voyagers(self, client):
         resp = client.post("/v1/big-endian-first-light", json={
@@ -38,6 +38,9 @@ class TestIndividualCategories:
         assert v1["distance_travelled_since_birth_km"] > 0
 
     def test_exoplanets(self, client):
+        # A 25 ly sphere contains known planet hosts (Proxima,
+        # GJ 876, Tau Ceti...), so zero would mean the matching
+        # is broken.
         resp = client.post("/v1/big-endian-first-light", json={
             "birthday": "2000-01-01",
             "as_of": "2025-01-01",
@@ -45,9 +48,12 @@ class TestIndividualCategories:
         })
         assert resp.status_code == 200
         data = resp.json()
-        assert "estimated_exoplanets" in data
-        assert data["estimated_exoplanets"] >= 0
-        assert "potentially_habitable" in data
+        assert data["estimated_exoplanets"] > 0
+        assert data["potentially_habitable"] > 0
+        assert (
+            data["potentially_habitable"]
+            < data["estimated_exoplanets"]
+        )
 
     def test_body_stats(self, client):
         resp = client.post("/v1/big-endian-first-light", json={
@@ -104,6 +110,72 @@ class TestIndividualCategories:
         data = resp.json()
         assert "universe_age_percent" in data
         assert 0 < data["universe_age_percent"] < 1
+
+    def test_sun_constellation(self, client):
+        resp = client.post("/v1/big-endian-first-light", json={
+            "birthday": "2000-12-05",
+            "as_of": "2025-01-01",
+            "categories": ["sun_constellation"],
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        sc = data["sun_constellation"]
+        assert sc["constellation"] == "Ophiuchus"
+        assert sc["zodiac_sign"] == "Sagittarius"
+        assert sc["matches_zodiac_sign"] is False
+        assert "age_years" not in data
+
+    def test_moon_includes_next_full_moon(self, client):
+        resp = client.post("/v1/big-endian-first-light", json={
+            "birthday": "2000-06-15",
+            "as_of": "2025-06-15",
+            "categories": ["moon"],
+        })
+        assert resp.status_code == 200
+        # Real full moon: 2025-07-10.
+        assert resp.json()["next_full_moon_date"] == "2025-07-10"
+
+    def test_eclipses_include_next_dates(self, client):
+        resp = client.post("/v1/big-endian-first-light", json={
+            "birthday": "2000-01-01",
+            "as_of": "2025-01-01",
+            "categories": ["eclipses"],
+        })
+        assert resp.status_code == 200
+        ec = resp.json()["eclipses"]
+        assert ec["next_solar_eclipse"] == "2025-03-29"
+        assert ec["next_lunar_eclipse"] == "2025-03-14"
+
+    def test_stars_reached_this_year(self, client):
+        resp = client.post("/v1/big-endian-first-light", json={
+            "birthday": "2000-06-15",
+            "as_of": "2025-06-15",
+            "categories": ["stars"],
+            "star_limit": 1,
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        # Independently derived from the catalogue: stars in
+        # the (radius - 1, radius] shell, with the radius
+        # computed exactly as the engine computes it.
+        from astropy import units as u
+        from astropy.time import Time
+
+        from src.compute import NEARBY_STARS
+
+        radius = (
+            (Time("2025-06-15") - Time("2000-06-15"))
+            .to(u.yr).value
+        )
+        expected = sum(
+            1 for s in NEARBY_STARS
+            if radius - 1.0 < s["distance_ly"] <= radius
+        )
+        assert data["stars_reached_this_year"] == expected
+        assert (
+            data["stars_reached_this_year"]
+            <= data["stars_reached"]
+        )
 
     def test_star_coordinates(self, client):
         resp = client.post("/v1/big-endian-first-light", json={

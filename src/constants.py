@@ -110,7 +110,10 @@ BODY_SURFACE_AREA_M2 = 1.7  # Average adult body surface area
 AVG_HEARTBEATS_PER_MIN = 72  # Resting heart rate
 AVG_BREATHS_PER_MIN = 15  # Average adult respiratory rate
 AVG_BLINKS_PER_MIN = 17  # Spontaneous blink rate (waking hours only)
-AVG_IR_PHOTON_ENERGY_J = 1.99e-20  # ~10 um IR peak at 310 K (hc/lambda)
+# Mean energy of a photon in 310.15 K blackbody radiation:
+# <E> = 2.701 * k_B * T, the correct divisor for counting
+# emitted photons (the Wien-peak energy undercounts by ~1.7x).
+MEAN_IR_PHOTON_ENERGY_J = 2.701 * const.k_B.value * BODY_TEMP_K
 WAKING_FRACTION = 2 / 3  # ~16 h waking out of 24 h
 
 # ---------------------------------------------------------------------------
@@ -121,16 +124,52 @@ SYNODIC_MONTH = 29.530588853  # days
 # Known New Moon reference: 2000-01-06 18:14 UTC (Julian Day 2451550.26)
 NEW_MOON_JD = 2451550.26
 
+# (moon age threshold in days, phase name). Lookup picks the
+# name of the largest threshold <= moon age. The four principal
+# phases get windows centred on their geometric instants
+# (+-0.5 day), so a moon a few hours before exact full is
+# labelled "Full Moon" rather than "Waxing Gibbous"; the
+# intermediate phases fill the gaps. The final entry wraps the
+# last half-day of the cycle back to New Moon.
 MOON_PHASES = [
     (0, "New Moon"),
-    (1, "Waxing Crescent"),
-    (7.38, "First Quarter"),
-    (8, "Waxing Gibbous"),
-    (14.77, "Full Moon"),
-    (15.5, "Waning Gibbous"),
-    (22.15, "Third Quarter"),
-    (22.75, "Waning Crescent"),
+    (0.5, "Waxing Crescent"),
+    (6.8826, "First Quarter"),
+    (7.8826, "Waxing Gibbous"),
+    (14.2653, "Full Moon"),
+    (15.2653, "Waning Gibbous"),
+    (21.6479, "Third Quarter"),
+    (22.6479, "Waning Crescent"),
+    (29.0306, "New Moon"),
 ]
+
+# ---------------------------------------------------------------------------
+# Zodiac (tropical) sign boundaries: (start_month, start_day, sign).
+# Conventional newspaper dates; the sign runs from its start date
+# to the day before the next sign's start. Capricorn wraps the
+# year end and is handled as the fallback.
+# ---------------------------------------------------------------------------
+ZODIAC_SIGNS: tuple[tuple[int, int, str], ...] = (
+    (1, 20, "Aquarius"),
+    (2, 19, "Pisces"),
+    (3, 21, "Aries"),
+    (4, 20, "Taurus"),
+    (5, 21, "Gemini"),
+    (6, 21, "Cancer"),
+    (7, 23, "Leo"),
+    (8, 23, "Virgo"),
+    (9, 23, "Libra"),
+    (10, 23, "Scorpio"),
+    (11, 22, "Sagittarius"),
+    (12, 22, "Capricorn"),
+)
+
+# Astrological sign name -> IAU constellation name, where the two
+# spellings differ.
+SIGN_CONSTELLATIONS = {
+    "Scorpio": "Scorpius",
+    "Capricorn": "Capricornus",
+}
 
 # ---------------------------------------------------------------------------
 # Derived / domain-specific thresholds

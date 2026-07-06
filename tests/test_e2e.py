@@ -162,7 +162,12 @@ class TestRateLimitingE2E:
         assert "Retry-After" in r2.headers
         assert "Rate limited" in r2.json()["detail"]
 
-    def test_different_ips_not_blocked(self, client):
+    def test_different_ips_not_blocked(
+        self, client, monkeypatch,
+    ):
+        import src.app as app_module
+
+        monkeypatch.setattr(app_module, "TRUSTED_PROXY_HOPS", 1)
         payload = {
             "birthday": "2000-06-15",
             "as_of": "2025-06-15",
@@ -179,8 +184,13 @@ class TestRateLimitingE2E:
         assert r1.status_code == 200
         assert r2.status_code == 200
 
-    def test_spoof_resistance_rightmost_ip(self, client):
+    def test_spoof_resistance_rightmost_ip(
+        self, client, monkeypatch,
+    ):
         """Spoofing the leftmost IP should not bypass the limit."""
+        import src.app as app_module
+
+        monkeypatch.setattr(app_module, "TRUSTED_PROXY_HOPS", 1)
         payload = {
             "birthday": "2000-06-15",
             "as_of": "2025-06-15",
@@ -242,14 +252,18 @@ class TestDataIntegrity:
         ]:
             assert star in names, f"{star} missing"
 
-    def test_no_duplicate_stars(self, client):
-        r = client.post("/v1/big-endian-first-light", json={
-            "birthday": "1975-01-01",
-            "as_of": "2025-06-15",
-            "categories": ["stars"],
-        })
-        names = [s["name"] for s in r.json()["stars"]]
-        assert len(names) == len(set(names))
+    def test_no_duplicate_stars(self):
+        """Name uniqueness over the ENTIRE catalogue, not just
+        the truncated response list a request returns."""
+        from collections import Counter
+
+        from src.compute import NEARBY_STARS
+
+        counts = Counter(s["name"] for s in NEARBY_STARS)
+        dupes = sorted(
+            n for n, c in counts.items() if c > 1
+        )
+        assert not dupes, f"duplicate names: {dupes[:10]}"
 
     def test_proxima_distance(self, client):
         r = client.post("/v1/big-endian-first-light", json={
@@ -270,8 +284,6 @@ class TestDataIntegrity:
             "categories": ["eclipses"],
         })
         ec = r.json()["eclipses"]
-        assert ec["solar_eclipses"] > 40
-        assert ec["lunar_eclipses"] > 40
-        assert ec["total_eclipses"] == (
-            ec["solar_eclipses"] + ec["lunar_eclipses"]
-        )
+        assert ec["solar_eclipses"] == 56
+        assert ec["lunar_eclipses"] == 57
+        assert ec["total_eclipses"] == 113

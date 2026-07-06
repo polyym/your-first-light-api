@@ -6,22 +6,125 @@ Queries HIPPARCOS, Gliese Catalogue of Nearby Stars, and Gaia DR3 via Vizier,
 plus the NASA Exoplanet Archive for planet counts. Merges and deduplicates
 results to produce the most complete nearby star catalogue possible.
 
-Run locally whenever you want fresh data, then commit and push:
+Normally run via the scheduled data-refresh workflow or the single
+entry point:
 
-    pip install astropy astroquery   # one-time
-    python tools/update_stars.py
-    git add data/stars.json
-    git commit -m "Refresh star catalogue"
-    git push
+    pip install -e ".[catalogue]"    # one-time
+    python tools/update_data.py stars
+
+The write is atomic and only happens when the content changed;
+validation failures exit non-zero without touching the data file.
 """
 
 import json
 import math
+import os
 import sys
 from pathlib import Path
 
 MAX_RADIUS_LY = 160  # covers anyone up to ~160 years old
 MIN_PARALLAX_SNR = 5  # reject stars where Plx / e_Plx < this
+
+# --- Cross-catalogue duplicate detection -----------------------------------
+# Matching is two-tier:
+#
+# Tier 1 (same position): cross-catalogue entries within COINCIDENT_SEP_ARCSEC
+# are the same physical star REGARDLESS of how much their distances disagree.
+# With ~26k stars on the whole sky the expected number of chance alignments
+# this close is below one, while Gliese photometric parallaxes and faint-end
+# HIPPARCOS parallaxes routinely disagree with Gaia by 10-80 percent, so a
+# distance test here creates duplicates instead of preventing them.
+#
+# Tier 2 (proper-motion window): between COINCIDENT_SEP_ARCSEC and
+# MERGE_MAX_SEP_DEG (which absorbs epoch drift for fast movers like
+# Barnard's Star, ~0.07 deg between the HIPPARCOS and Gaia epochs) the
+# distances must also agree within a distance-scaled tolerance, because a
+# window this wide contains genuinely unrelated stars.
+COINCIDENT_SEP_ARCSEC = 15.0
+MERGE_MAX_SEP_DEG = 0.15  # 540 arcsec
+
+# Tier 2 distance agreement scales with distance, because parallax
+# uncertainty (and hence inter-catalogue disagreement) grows with distance:
+# real disagreement of several light-years is normal beyond ~20 ly. A fixed
+# 1 ly tolerance is what allowed ~4,000 duplicated stars into the catalogue.
+MERGE_DIST_TOL_FRACTION = 0.10
+MERGE_DIST_TOL_FLOOR_LY = 1.0
+
+# Validation thresholds: entries closer than DUPLICATE_SEP_ARCSEC on the sky
+# whose distances disagree by more than max(FLOOR, FRACTION * distance) are
+# flagged as duplicates, unless they are a resolved pair from a single
+# catalogue or a hand-curated multiple system. Genuine components agree in
+# distance to within a few percent; duplicates disagree by far more.
+DUPLICATE_SEP_ARCSEC = 15.0
+DUPLICATE_DIST_TOL_FRACTION = 0.05
+DUPLICATE_DIST_TOL_FLOOR_LY = 0.5
+
+# Relative reliability of parallaxes per source; on a merge the distance is
+# taken from the most reliable contributing catalogue.
+_SOURCE_QUALITY = {"gliese": 1, "hipparcos": 2, "gaia": 3}
+
+# Minimum plausible result sizes per upstream fetch, set at roughly half of
+# what each source returns today (HIPPARCOS 6.5k, Gliese 3.1k, Gaia 48k rows;
+# Exoplanet Archive 5.6k name keys). A fetch below its floor means the source
+# failed or silently degraded, and building a catalogue from what remains
+# would produce a plausible-looking but incomplete data file, so the run
+# refuses to continue instead.
+MIN_FETCH_COUNTS = {
+    "hipparcos": 3_000,
+    "gliese": 1_500,
+    "gaia": 20_000,
+    "exoplanet_archive": 1_000,
+}
+
+
+def check_fetch_counts(counts: dict[str, int]) -> list[str]:
+    """Guard against silently degraded upstream fetches.
+
+    Args:
+        counts: Mapping of fetch label (a ``MIN_FETCH_COUNTS``
+            key) to the number of rows/keys it returned.
+
+    Returns:
+        A list of error messages; empty when every fetch met
+        its floor.
+    """
+    errors = []
+    for label, count in counts.items():
+        floor = MIN_FETCH_COUNTS[label]
+        if count < floor:
+            errors.append(
+                f"FETCH: {label} returned {count} rows "
+                f"(expected >= {floor}); refusing to build "
+                f"a degraded catalogue"
+            )
+    return errors
+
+
+def _distance_tolerance_ly(distance_ly: float) -> float:
+    """Tier 2 distance disagreement allowed for one star."""
+    return max(
+        MERGE_DIST_TOL_FLOOR_LY,
+        MERGE_DIST_TOL_FRACTION * distance_ly,
+    )
+
+
+def _sources(s: dict) -> set[str]:
+    """Every catalogue this (possibly merged) entry drew from.
+
+    Args:
+        s: Star dict, before or after merging/writing.
+
+    Returns:
+        Set of source names; empty for hand-curated entries.
+    """
+    merged = s.get("_merged_sources")
+    if merged:
+        return merged
+    listed = s.get("sources")
+    if listed:
+        return set(listed)
+    src = s.get("_source") or s.get("source")
+    return {src} if src else set()
 
 
 # ---------------------------------------------------------------------------
@@ -307,8 +410,9 @@ EXTRA_STARS = [
     {"name": "Groombridge 34 B", "distance_ly": 11.624, "spectral_type": "M3.5V", "apparent_magnitude": 11.06, "known_exoplanets": 0, "ra_deg": 4.5956, "dec_deg": 44.0222},
     {"name": "GJ 1061", "distance_ly": 11.991, "spectral_type": "M5.5V", "apparent_magnitude": 13.09, "known_exoplanets": 3, "ra_deg": 53.7423, "dec_deg": -44.6393},
     {"name": "DX Cancri", "distance_ly": 11.826, "spectral_type": "M6.5Ve", "apparent_magnitude": 14.78, "known_exoplanets": 0, "ra_deg": 124.7430, "dec_deg": 26.7670},
+    # NOTE: "SO 0253+1652" is Teegarden's Star's discovery
+    # designation and must not be listed as a separate entry.
     {"name": "Teegarden's Star", "distance_ly": 12.497, "spectral_type": "M7.0V", "apparent_magnitude": 15.40, "known_exoplanets": 2, "ra_deg": 43.2537, "dec_deg": 16.8813},
-    {"name": "SO 0253+1652", "distance_ly": 12.54, "spectral_type": "M7.0V", "apparent_magnitude": 15.14, "known_exoplanets": 0, "ra_deg": 43.4750, "dec_deg": 16.8725},
     {"name": "SCR 1845-6357 A", "distance_ly": 12.57, "spectral_type": "M8.5V", "apparent_magnitude": 17.39, "known_exoplanets": 0, "ra_deg": 281.2719, "dec_deg": -63.9631},
     {"name": "DENIS J1048-3956", "distance_ly": 13.17, "spectral_type": "M8.5V", "apparent_magnitude": 17.39, "known_exoplanets": 0, "ra_deg": 162.0611, "dec_deg": -39.9351},
     {"name": "SCR J1546-5534", "distance_ly": 14.10, "spectral_type": "M8.5V", "apparent_magnitude": 17.30, "known_exoplanets": 0, "ra_deg": 236.6742, "dec_deg": -55.5736},
@@ -383,6 +487,7 @@ def fetch_hipparcos(max_dist_ly: float) -> list[dict]:
             "distance_ly": round(dist_ly, 4),
             "spectral_type": sp,
             "apparent_magnitude": round(vmag, 2),
+            "magnitude_band": "V",
             "known_exoplanets": 0,
             "ra_deg": round(ra, 4) if ra is not None else None,
             "dec_deg": round(dec, 4) if dec is not None else None,
@@ -455,6 +560,7 @@ def fetch_gliese(max_dist_ly: float) -> list[dict]:
             "distance_ly": round(dist_ly, 4),
             "spectral_type": sp,
             "apparent_magnitude": round(vmag, 2),
+            "magnitude_band": "V",
             "known_exoplanets": 0,
             "ra_deg": round(ra, 4) if ra is not None else None,
             "dec_deg": round(dec, 4) if dec is not None else None,
@@ -465,11 +571,87 @@ def fetch_gliese(max_dist_ly: float) -> list[dict]:
     return stars
 
 
+def gaia_g_to_v(gmag: float, bp_rp: float | None) -> float | None:
+    """Approximate Johnson V from Gaia DR3 G using BP-RP colour.
+
+    Uses the Gaia DR3 photometric relationship (Riello et al.
+    2021): ``G - V = -0.02704 + 0.01424x - 0.2156x^2 +
+    0.01426x^3`` with ``x = BP-RP``, valid for -0.5 < x < 5.0.
+    For red stars G can be up to ~1.5 mag brighter than V, so
+    storing raw G in a V-band field inflates naked-eye counts.
+
+    Args:
+        gmag: Gaia broad-band G magnitude.
+        bp_rp: Gaia BP-RP colour, or ``None`` when unavailable.
+
+    Returns:
+        Estimated V magnitude, or ``None`` when the colour is
+        missing or outside the relation's validity range.
+    """
+    if bp_rp is None or not (-0.5 < bp_rp < 5.0):
+        return None
+    g_minus_v = (
+        -0.02704
+        + 0.01424 * bp_rp
+        - 0.2156 * bp_rp**2
+        + 0.01426 * bp_rp**3
+    )
+    return gmag - g_minus_v
+
+
+def estimate_spectral_class(
+    bp_rp: float | None,
+    gmag: float,
+    dist_ly: float,
+) -> str:
+    """Estimate a coarse spectral class from Gaia colour.
+
+    Main-sequence boundaries follow the Pecaut & Mamajek (2013)
+    BP-RP colour table; blue objects far too faint for the main
+    sequence at their measured distance are white dwarfs. The
+    result carries an ``(est)`` marker so estimated classes are
+    always distinguishable from catalogue MK types; the API's
+    ``classify_spectral`` reads only the first letter, so
+    estimates group correctly in ``star_type_breakdown``.
+
+    Args:
+        bp_rp: Gaia BP-RP colour, or ``None`` when unavailable.
+        gmag: Gaia broad-band G magnitude.
+        dist_ly: Distance in light-years.
+
+    Returns:
+        A string like ``"M (est)"``, or ``""`` when no estimate
+        is possible.
+    """
+    if bp_rp is None or gmag == 99.0 or dist_ly <= 0:
+        return ""
+    dist_pc = dist_ly / 3.26156
+    abs_g = gmag - 5 * math.log10(dist_pc / 10)
+    # Blue but intrinsically faint: white dwarf territory.
+    if bp_rp < 1.0 and abs_g > 10.0:
+        return "D (est)"
+    if bp_rp < 0.0:
+        return "B (est)"
+    if bp_rp < 0.37:
+        return "A (est)"
+    if bp_rp < 0.77:
+        return "F (est)"
+    if bp_rp < 0.98:
+        return "G (est)"
+    if bp_rp < 1.84:
+        return "K (est)"
+    if bp_rp < 5.0:
+        return "M (est)"
+    return ""
+
+
 def fetch_gaia_nearby(max_dist_ly: float) -> list[dict]:
     """Query Gaia DR3 via Vizier for nearby stars.
 
     Falls back to the Gaia EDR3 distances catalogue if the
-    primary DR3 catalogue returns no results.
+    primary DR3 catalogue returns no results.  G magnitudes are
+    converted to approximate V using BP-RP where possible and
+    labelled with their band otherwise.
 
     Args:
         max_dist_ly: Maximum distance in light-years.
@@ -485,7 +667,7 @@ def fetch_gaia_nearby(max_dist_ly: float) -> list[dict]:
 
     print(f"[3/4] Querying Gaia DR3 (parallax > {min_parallax:.1f} mas)...")
     v = Vizier(
-        columns=["Source", "Plx", "e_Plx", "Gmag", "_RAJ2000", "_DEJ2000"],
+        columns=["Source", "Plx", "e_Plx", "Gmag", "BP-RP", "_RAJ2000", "_DEJ2000"],
         row_limit=-1,
     )
 
@@ -534,7 +716,13 @@ def fetch_gaia_nearby(max_dist_ly: float) -> list[dict]:
             gmag = float(row["Gmag"]) if "Gmag" in row.colnames and row["Gmag"] else 99.0
         except (ValueError, TypeError):
             gmag = 99.0
-        sp = ""
+        try:
+            bp_rp = float(row["BP-RP"]) if "BP-RP" in row.colnames else None
+            if bp_rp is not None and math.isnan(bp_rp):
+                bp_rp = None
+        except (ValueError, TypeError):
+            bp_rp = None
+        sp = estimate_spectral_class(bp_rp, gmag, dist_ly)
         source_id = str(row["Source"]) if "Source" in row.colnames else "unknown"
 
         try:
@@ -543,11 +731,18 @@ def fetch_gaia_nearby(max_dist_ly: float) -> list[dict]:
         except (KeyError, ValueError, TypeError):
             ra, dec = None, None
 
+        v_est = gaia_g_to_v(gmag, bp_rp) if gmag != 99.0 else None
+        if v_est is not None:
+            mag, band = round(v_est, 2), "V"
+        else:
+            mag, band = round(gmag, 2), "G"
+
         stars.append({
             "name": f"Gaia DR3 {source_id}",
             "distance_ly": round(dist_ly, 4),
             "spectral_type": sp,
-            "apparent_magnitude": round(gmag, 2),
+            "apparent_magnitude": mag,
+            "magnitude_band": band,
             "known_exoplanets": 0,
             "ra_deg": round(ra, 4) if ra is not None else None,
             "dec_deg": round(dec, 4) if dec is not None else None,
@@ -737,9 +932,19 @@ def _is_catalogue_id(name: str) -> bool:
 def _same_star(a: dict, b: dict) -> bool:
     """Heuristic: are two catalogue entries the same physical star?
 
-    Uses HIP ID, name matching, AND coordinate proximity to avoid
-    false positives from stars at similar distances in different
-    parts of the sky.
+    Rules, in order:
+
+    - Two entries with HIP IDs match only when the IDs are equal.
+    - Entries whose source sets overlap never match: genuine
+      close pairs (binaries) appear as separate rows within one
+      catalogue, and each row is a distinct object.
+    - Two entries with the same common name match when close on
+      the sky; two DIFFERENT common names never match.
+    - Otherwise (at least one catalogue ID): positions within
+      ``COINCIDENT_SEP_ARCSEC`` match unconditionally (tier 1),
+      and positions within ``MERGE_MAX_SEP_DEG`` match when the
+      distances also agree within the scaled tolerance (tier 2,
+      the proper-motion drift window).
 
     Args:
         a: First star dict.
@@ -748,85 +953,129 @@ def _same_star(a: dict, b: dict) -> bool:
     Returns:
         ``True`` if the entries likely represent the same star.
     """
-    # Same HIP ID is a definitive match
     hip_a = a.get("_hip_id")
     hip_b = b.get("_hip_id")
     if hip_a and hip_b:
         return hip_a == hip_b
+
+    if _sources(a) & _sources(b):
+        return False
 
     sep = _angular_sep_deg(
         a.get("ra_deg"), a.get("dec_deg"),
         b.get("ra_deg"), b.get("dec_deg"),
     )
 
-    # Same common name AND close on the sky
-    if (not _is_catalogue_id(a["name"])
-            and not _is_catalogue_id(b["name"])
-            and a["name"].lower() == b["name"].lower()):
-        return sep < 5.0
-
-    # Both have distinct common names → different stars
-    if not _is_catalogue_id(a["name"]) and not _is_catalogue_id(b["name"]):
+    a_common = not _is_catalogue_id(a["name"])
+    b_common = not _is_catalogue_id(b["name"])
+    if a_common and b_common:
+        if a["name"].lower() == b["name"].lower():
+            return sep < 5.0
         return False
 
-    # At least one is a catalogue ID: match if close in distance
-    # AND on the same part of the sky. The 5° threshold allows
-    # for proper-motion differences between catalogue epochs while
-    # still rejecting stars that are merely at similar distances.
-    dist_diff = abs(a["distance_ly"] - b["distance_ly"])
-    if dist_diff < 1.0 and sep < 5.0:
+    if sep < COINCIDENT_SEP_ARCSEC / 3600.0:
         return True
 
-    return False
+    dist_diff = abs(a["distance_ly"] - b["distance_ly"])
+    tol = _distance_tolerance_ly(
+        min(a["distance_ly"], b["distance_ly"]),
+    )
+    return dist_diff < tol and sep < MERGE_MAX_SEP_DEG
+
+
+def _absorb(existing: dict, star: dict) -> None:
+    """Fold a duplicate entry into its canonical merged entry.
+
+    Keeps the richer name, non-empty spectral type, V-band
+    magnitude, higher exoplanet count, HIP ID, and coordinates,
+    and adopts the distance from the most reliable contributing
+    catalogue (Gaia over HIPPARCOS over Gliese).
+
+    Args:
+        existing: The merged entry to keep (mutated in place).
+        star: The duplicate entry being absorbed.
+    """
+    if (_is_catalogue_id(existing["name"])
+            and not _is_catalogue_id(star["name"])):
+        existing["name"] = star["name"]
+    if (existing["spectral_type"] == ""
+            and star["spectral_type"] != ""):
+        existing["spectral_type"] = star["spectral_type"]
+    if star["known_exoplanets"] > existing["known_exoplanets"]:
+        existing["known_exoplanets"] = star["known_exoplanets"]
+    if not existing.get("_hip_id") and star.get("_hip_id"):
+        existing["_hip_id"] = star["_hip_id"]
+    if (existing.get("ra_deg") is None
+            and star.get("ra_deg") is not None):
+        existing["ra_deg"] = star["ra_deg"]
+        existing["dec_deg"] = star["dec_deg"]
+    if (existing.get("magnitude_band") == "G"
+            and star.get("magnitude_band") == "V"):
+        existing["apparent_magnitude"] = star["apparent_magnitude"]
+        existing["magnitude_band"] = "V"
+
+    q_existing = _SOURCE_QUALITY.get(
+        existing.get("_dist_source") or existing.get("_source"),
+        0,
+    )
+    q_star = _SOURCE_QUALITY.get(
+        star.get("_dist_source") or star.get("_source"), 0,
+    )
+    if q_star > q_existing:
+        existing["distance_ly"] = star["distance_ly"]
+        existing["_dist_source"] = (
+            star.get("_dist_source") or star.get("_source")
+        )
+
+    existing["_merged_sources"] = _sources(existing) | _sources(star)
 
 
 def merge_catalogues(*catalogues: list[dict]) -> list[dict]:
     """Merge multiple star lists, deduplicating across catalogues.
 
-    When a duplicate is detected (via ``_same_star``), the merged
-    entry keeps the richer name, non-empty spectral type, and
-    higher exoplanet count.
+    Each incoming star is absorbed into the closest (smallest
+    angular separation) matching entry rather than the first one
+    encountered, so binary components pair up with the right
+    counterpart when both are present.
 
     Args:
         *catalogues: One or more star-dict lists to merge.
             Order matters: earlier catalogues are preferred for
-            naming.
+            naming and magnitudes.
 
     Returns:
         A single deduplicated list of star dicts.
     """
-    merged = []
+    merged: list[dict] = []
     for catalogue in catalogues:
         for star in catalogue:
-            is_dup = False
+            best: dict | None = None
+            best_sep = 0.0
+            dec_s = star.get("dec_deg")
             for existing in merged:
-                dist_diff = abs(
-                    existing["distance_ly"] - star["distance_ly"]
-                )
-                if dist_diff > 2.0:
+                # Cheap declination pre-filter before the full
+                # trigonometry: sep >= |delta dec| always.
+                dec_e = existing.get("dec_deg")
+                if (
+                    dec_e is not None
+                    and dec_s is not None
+                    and abs(dec_e - dec_s) > MERGE_MAX_SEP_DEG
+                ):
                     continue
+                if not _same_star(existing, star):
+                    continue
+                sep = _angular_sep_deg(
+                    existing.get("ra_deg"),
+                    existing.get("dec_deg"),
+                    star.get("ra_deg"), star.get("dec_deg"),
+                )
+                if best is None or sep < best_sep:
+                    best, best_sep = existing, sep
 
-                if _same_star(existing, star):
-                    # Merge: prefer common name, fill missing data
-                    if (_is_catalogue_id(existing["name"])
-                            and not _is_catalogue_id(star["name"])):
-                        existing["name"] = star["name"]
-                    if (existing["spectral_type"] == ""
-                            and star["spectral_type"] != ""):
-                        existing["spectral_type"] = star["spectral_type"]
-                    if star["known_exoplanets"] > existing["known_exoplanets"]:
-                        existing["known_exoplanets"] = star["known_exoplanets"]
-                    if not existing.get("_hip_id") and star.get("_hip_id"):
-                        existing["_hip_id"] = star["_hip_id"]
-                    if (existing.get("ra_deg") is None
-                            and star.get("ra_deg") is not None):
-                        existing["ra_deg"] = star["ra_deg"]
-                        existing["dec_deg"] = star["dec_deg"]
-                    is_dup = True
-                    break
-
-            if not is_dup:
+            if best is None:
                 merged.append(dict(star))
+            else:
+                _absorb(best, star)
 
     return merged
 
@@ -842,8 +1091,10 @@ def dedup_by_coordinates(
 
     After EXTRA_STARS are injected, Gaia/Gliese entries for the
     same physical star may remain under catalogue designations.
-    This removes them by matching coordinates (< 0.01 deg) and
-    distance (< 1.0 ly).
+    This removes them using the same distance-scaled tolerance
+    and proper-motion-aware separation as ``_same_star``, so
+    fast movers like Teegarden's Star are caught even though
+    their catalogue positions drift arcminutes between epochs.
     """
     to_remove: list[int] = []
     auth_names = {s["name"] for s in authoritative}
@@ -856,16 +1107,7 @@ def dedup_by_coordinates(
             if (auth.get("ra_deg") is None
                     or s.get("ra_deg") is None):
                 continue
-            dist_diff = abs(
-                s["distance_ly"] - auth["distance_ly"]
-            )
-            if dist_diff > 1.0:
-                continue
-            sep = _angular_sep_deg(
-                s["ra_deg"], s["dec_deg"],
-                auth["ra_deg"], auth["dec_deg"],
-            )
-            if sep < 0.01:
+            if _same_star(s, auth):
                 to_remove.append(i)
                 break
     for i in sorted(set(to_remove), reverse=True):
@@ -979,8 +1221,68 @@ def apply_overrides(stars: list[dict]) -> int:
             override = KNOWN_STAR_OVERRIDES[s["name"]]
             for key, val in override.items():
                 s[key] = val
+            # Override magnitudes are SIMBAD V magnitudes.
+            s["magnitude_band"] = "V"
             fixed += 1
     return fixed
+
+
+def find_positional_duplicates(
+    stars: list[dict],
+    max_sep_arcsec: float = DUPLICATE_SEP_ARCSEC,
+) -> list[tuple[int, int, float]]:
+    """Find entry pairs that look like one star listed twice.
+
+    A pair is suspicious when the sky positions nearly coincide
+    but the distances disagree by more than a few percent: the
+    signature of one physical star entering from catalogues
+    whose parallaxes disagree.  Not flagged: components of
+    genuine multiple systems (same position AND distance),
+    resolved pairs within a single source catalogue, and
+    hand-curated system components (both carry common names).
+
+    Args:
+        stars: Star catalogue to scan.
+        max_sep_arcsec: Angular separation threshold.
+
+    Returns:
+        A list of ``(index_a, index_b, separation_deg)`` tuples.
+    """
+    max_sep_deg = max_sep_arcsec / 3600.0
+    order = sorted(
+        (i for i, s in enumerate(stars)
+         if s.get("ra_deg") is not None),
+        key=lambda i: stars[i]["dec_deg"],
+    )
+    pairs: list[tuple[int, int, float]] = []
+    for pos, i in enumerate(order):
+        for j in order[pos + 1:]:
+            # Sorted by declination: once the dec gap exceeds
+            # the threshold nothing further can be close.
+            if (stars[j]["dec_deg"] - stars[i]["dec_deg"]
+                    > max_sep_deg):
+                break
+            a, b = stars[i], stars[j]
+            if (not _is_catalogue_id(a["name"])
+                    and not _is_catalogue_id(b["name"])):
+                continue  # hand-curated system components
+            if _sources(a) & _sources(b):
+                continue  # resolved pair within one catalogue
+            sep = _angular_sep_deg(
+                a["ra_deg"], a["dec_deg"],
+                b["ra_deg"], b["dec_deg"],
+            )
+            if sep >= max_sep_deg:
+                continue
+            d_a = a["distance_ly"]
+            d_b = b["distance_ly"]
+            tol = max(
+                DUPLICATE_DIST_TOL_FLOOR_LY,
+                DUPLICATE_DIST_TOL_FRACTION * min(d_a, d_b),
+            )
+            if abs(d_a - d_b) > tol:
+                pairs.append((i, j, sep))
+    return pairs
 
 
 def validate_catalogue(stars: list[dict]) -> list[str]:
@@ -997,6 +1299,19 @@ def validate_catalogue(stars: list[dict]) -> list[str]:
         catalogue is clean and ready to commit.
     """
     errors = []
+
+    # Positional duplicates: same sky position, disagreeing
+    # distance. This is exactly the corruption that duplicated
+    # ~4,000 stars in the v1.0 catalogue, so its presence must
+    # fail the run rather than pass silently.
+    for i, j, sep in find_positional_duplicates(stars):
+        errors.append(
+            f"POSITIONAL_DUP: '{stars[i]['name']}' "
+            f"({stars[i]['distance_ly']} ly) and "
+            f"'{stars[j]['name']}' "
+            f"({stars[j]['distance_ly']} ly) are "
+            f"{sep * 3600:.1f} arcsec apart"
+        )
 
     # Duplicate names (should have been caught by dedup_by_name)
     seen_names: dict[str, int] = {}
@@ -1060,13 +1375,27 @@ def validate_catalogue(stars: list[dict]) -> list[str]:
 # ---------------------------------------------------------------------------
 # Write output
 # ---------------------------------------------------------------------------
-def write_stars(stars: list[dict]) -> None:
+def write_stars(
+    stars: list[dict],
+    output_path: Path | None = None,
+) -> bool:
     """Sort by distance and write the star catalogue to ``data/stars.json``.
+
+    The file is written to a temporary sibling and moved into
+    place with ``os.replace`` so an interrupted run can never
+    leave a truncated catalogue behind.  When the serialised
+    content is identical to what is already on disk, nothing is
+    written, so automated runs can tell "refreshed" from
+    "actually changed".
 
     Args:
         stars: Final validated star catalogue.
+        output_path: Override the destination (used by tests).
+
+    Returns:
+        ``True`` when the file on disk changed.
     """
-    stars.sort(key=lambda s: s["distance_ly"])
+    stars.sort(key=lambda s: (s["distance_ly"], s["name"]))
 
     clean = []
     for s in stars:
@@ -1075,16 +1404,55 @@ def write_stars(stars: list[dict]) -> None:
             "distance_ly": s["distance_ly"],
             "spectral_type": s["spectral_type"],
             "apparent_magnitude": s["apparent_magnitude"],
+            "magnitude_band": s.get("magnitude_band"),
             "known_exoplanets": s["known_exoplanets"],
             "ra_deg": s.get("ra_deg"),
             "dec_deg": s.get("dec_deg"),
+            # Provenance of the distance measurement.
+            "source": (
+                s.get("_dist_source")
+                or s.get("_source")
+                or s.get("source")
+                or "curated"
+            ),
+            # Every catalogue this entry drew from, so the
+            # positional-duplicate check can distinguish real
+            # component pairs (shared source) from duplicates
+            # on the written data exactly as the validator
+            # does on the in-memory entries.
+            "sources": sorted(_sources(s)) or ["curated"],
         })
 
-    output_path = Path(__file__).resolve().parent.parent.parent / "data" / "stars.json"
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(clean, f, indent=4)
+    if output_path is None:
+        output_path = (
+            Path(__file__).resolve().parent.parent.parent
+            / "data" / "stars.json"
+        )
+    payload = json.dumps(clean, indent=4)
+
+    if output_path.exists():
+        try:
+            unchanged = (
+                output_path.read_text(encoding="utf-8")
+                == payload
+            )
+        except OSError:
+            unchanged = False
+        if unchanged:
+            print(
+                f"\n{output_path.name} unchanged "
+                f"({len(clean)} stars); not rewritten"
+            )
+            return False
+
+    tmp_path = output_path.with_name(output_path.name + ".tmp")
+    # newline="\n" keeps output byte-identical across platforms
+    # (Windows text mode would otherwise write CRLF).
+    tmp_path.write_text(payload, encoding="utf-8", newline="\n")
+    os.replace(tmp_path, output_path)
 
     print(f"\nWrote {len(clean)} stars to {output_path}")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1101,6 +1469,22 @@ def main() -> None:
     hip_stars = fetch_hipparcos(MAX_RADIUS_LY)
     gliese_stars = fetch_gliese(MAX_RADIUS_LY)
     gaia_stars = fetch_gaia_nearby(MAX_RADIUS_LY)
+
+    # Refuse to continue if any source came back empty or thin:
+    # a catalogue built from the remainder would look plausible
+    # while silently missing thousands of stars.
+    fetch_errors = check_fetch_counts({
+        "hipparcos": len(hip_stars),
+        "gliese": len(gliese_stars),
+        "gaia": len(gaia_stars),
+    })
+    if fetch_errors:
+        print(f"\nERROR: {len(fetch_errors)} fetch failure(s):")
+        for e in fetch_errors:
+            print(f"  - {e}")
+        print("\nData NOT written. Upstream sources are "
+              "unavailable or degraded; retry later.")
+        sys.exit(1)
 
     # Merge all catalogue results (order matters: prefer named sources first)
     print("\nMerging catalogues...")
@@ -1138,11 +1522,23 @@ def main() -> None:
           f"{sp_fixed} spectral types fixed, "
           f"{mag_removed} no-magnitude entries dropped")
 
-    # Fetch and apply exoplanet counts (before overrides so overrides win)
+    # Fetch and apply exoplanet counts (before overrides so overrides win).
+    # A failed or thin archive response must fail the run: carrying on
+    # would zero out known_exoplanets across the catalogue while every
+    # other check stays green.
     exo_counts = fetch_exoplanet_counts()
-    if exo_counts:
-        matched = match_exoplanets(all_stars, exo_counts)
-        print(f"  Matched exoplanets to {matched} stars")
+    fetch_errors = check_fetch_counts({
+        "exoplanet_archive": len(exo_counts),
+    })
+    if fetch_errors:
+        print(f"\nERROR: {len(fetch_errors)} fetch failure(s):")
+        for e in fetch_errors:
+            print(f"  - {e}")
+        print("\nData NOT written. Upstream sources are "
+              "unavailable or degraded; retry later.")
+        sys.exit(1)
+    matched = match_exoplanets(all_stars, exo_counts)
+    print(f"  Matched exoplanets to {matched} stars")
 
     # Apply known-star overrides as final correction
     fixed = apply_overrides(all_stars)
@@ -1159,7 +1555,7 @@ def main() -> None:
         sys.exit(1)
 
     print("\nValidation passed")
-    write_stars(all_stars)
+    changed = write_stars(all_stars)
 
     # Summary
     within_15 = sum(1 for s in all_stars if s["distance_ly"] <= 15)
@@ -1174,10 +1570,11 @@ def main() -> None:
     print(f"  Total known exoplanets: {total_planets}")
 
     print()
-    print("Done! Now commit and push:")
-    print("  git add data/stars.json")
-    print('  git commit -m "Refresh star catalogue"')
-    print("  git push")
+    if changed:
+        print("Done! Review the diff, then commit data/stars.json")
+        print("(the scheduled workflow does this via a pull request).")
+    else:
+        print("Done! Catalogue already up to date.")
 
 
 if __name__ == "__main__":

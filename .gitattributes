@@ -1,0 +1,7 @@
+# Normalise line endings so local (Windows) and CI (Linux) runs
+# produce identical files. The generated data files and lock file
+# are pinned to LF so an automated regeneration never diffs on
+# line endings alone.
+* text=auto
+data/*.json text eol=lf
+requirements.lock text eol=lf

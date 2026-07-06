@@ -1,0 +1,66 @@
+# Scheduled data refresh: regenerates the star and eclipse
+# catalogues from their upstream sources, validates them (the
+# updaters exit non-zero on any integrity failure), runs the
+# full test suite against the refreshed data, and opens a pull
+# request only when the data actually changed. A human reviews
+# the diff before it reaches main.
+name: Update data catalogues
+
+on:
+  schedule:
+    # Monthly, on the 3rd at 04:17 UTC. Stars and exoplanet
+    # counts drift slowly; eclipse data is essentially static.
+    - cron: "17 4 3 * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update-data:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # Dependencies are installed explicitly here; the updater
+      # never installs anything itself.
+      - name: Install dependencies
+        run: python -m pip install -e ".[dev,catalogue]"
+
+      - name: Regenerate data catalogues
+        run: python tools/update_data.py
+
+      - name: Lint
+        run: python -m ruff check .
+
+      - name: Run test suite against refreshed data
+        run: python -m pytest -q
+
+      # Creates a PR only when the working tree differs, so
+      # no-change runs end quietly here.
+      - name: Open pull request if data changed
+        uses: peter-evans/create-pull-request@v7
+        with:
+          add-paths: data/
+          branch: data/refresh
+          delete-branch: true
+          commit-message: "Refresh data catalogues"
+          title: "Refresh data catalogues"
+          body: |
+            Automated monthly data refresh.
+
+            The updaters fetched the latest star and eclipse
+            data, the catalogue validators passed, and the full
+            test suite is green against the refreshed data.
+            data/manifest.json records entry counts and the date
+            each file last changed.
+
+            Review the diff before merging: these files drive
+            every API response.

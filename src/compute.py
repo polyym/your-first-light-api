@@ -17,9 +17,14 @@ import math
 import warnings
 from datetime import date
 from pathlib import Path
+from typing import Any
 
 from astropy import units as u
-from astropy.coordinates import GeocentricMeanEcliptic, get_body
+from astropy.coordinates import (
+    GeocentricMeanEcliptic,
+    get_body,
+    get_constellation,
+)
 from astropy.time import Time
 from erfa import ErfaWarning
 
@@ -33,7 +38,6 @@ from src.constants import (  # noqa: E402, I001
     AVG_BLINKS_PER_MIN,
     AVG_BREATHS_PER_MIN,
     AVG_HEARTBEATS_PER_MIN,
-    AVG_IR_PHOTON_ENERGY_J,
     AMBIENT_TEMP_K,
     BIRTHDAY_STAR_TOLERANCE_LY,
     BODY_SURFACE_AREA_M2,
@@ -47,6 +51,7 @@ from src.constants import (  # noqa: E402, I001
     HUBBLE_CONSTANT,
     LIGHT_SPEED_KM_S,
     LY_KM,
+    MEAN_IR_PHOTON_ENERGY_J,
     MILKY_WAY_DIAMETER_LY,
     MOON_DISTANCE_KM,
     MOON_PHASES,
@@ -58,6 +63,7 @@ from src.constants import (  # noqa: E402, I001
     PLUTO_DISTANCE_KM,
     SECONDS_PER_YEAR,
     SIDEREAL_DAY_SECONDS,
+    SIGN_CONSTELLATIONS,
     STEFAN_BOLTZMANN,
     SUN_DISTANCE_KM,
     SUN_GALACTIC_ORBITAL_SPEED_KM_S,
@@ -70,6 +76,7 @@ from src.constants import (  # noqa: E402, I001
     VOYAGER_2_MILESTONES,
     VOYAGER_2_SPEED_KM_S,
     WAKING_FRACTION,
+    ZODIAC_SIGNS,
 )
 from src.models import (  # noqa: E402
     BirthdayStar,
@@ -83,6 +90,7 @@ from src.models import (  # noqa: E402
     PlanetaryAge,
     ScaleComparison,
     StarInfo,
+    SunConstellation,
     VoyagerStatus,
 )
 
@@ -93,7 +101,21 @@ _STARS_PATH = (
     Path(__file__).resolve().parent.parent / "data" / "stars.json"
 )
 with open(_STARS_PATH, encoding="utf-8") as _f:
-    NEARBY_STARS: list[dict] = json.load(_f)
+    NEARBY_STARS: list[dict[str, Any]] = json.load(_f)
+
+# -------------------------------------------------------------------
+# Data manifest (optional; written by tools/update_data.py)
+# -------------------------------------------------------------------
+_MANIFEST_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "data"
+    / "manifest.json"
+)
+try:
+    with open(_MANIFEST_PATH, encoding="utf-8") as _f:
+        DATA_MANIFEST: dict[str, Any] = json.load(_f)
+except (OSError, json.JSONDecodeError):
+    DATA_MANIFEST = {}
 
 # -------------------------------------------------------------------
 # Eclipse catalogue (loaded once at import time)
@@ -149,10 +171,11 @@ def classify_spectral(sp: str) -> str:
 def compute_moon_phase(d: date) -> MoonPhaseAtBirth:
     """Compute the lunar phase at midnight UTC for a given date.
 
-    Uses astropy's ``get_body()`` with the built-in DE440s
-    ephemeris to compute precise geocentric positions of the
+    Uses astropy's ``get_body()`` with its built-in analytical
+    ephemeris (ERFA) to compute geocentric positions of the
     Moon and Sun, then derives phase from their ecliptic
-    longitude difference.
+    longitude difference.  ERFA's error is far below the
+    rounding applied to the response values.
 
     Note: The phase is evaluated at midnight UTC (00:00) on the
     given date. Intra-day variation is not captured.
@@ -200,9 +223,13 @@ def compute_moon_phase(d: date) -> MoonPhaseAtBirth:
 def count_full_moons(birth: date, ref: date) -> int:
     """Count full moons between two dates.
 
+    Both endpoint days are included: a full moon later in the
+    day on *ref* counts, so the result is consistent with
+    ``compute_moon_phase`` reporting "Full Moon" on that date.
+
     Args:
         birth: Start date (inclusive).
-        ref: End date (inclusive).
+        ref: End date (inclusive, through end of day).
 
     Returns:
         Number of full moons that occurred in the interval.
@@ -212,14 +239,121 @@ def count_full_moons(birth: date, ref: date) -> int:
     birth_age = (t_birth.jd - NEW_MOON_JD) % SYNODIC_MONTH
     days_to_first = (14.765 - birth_age) % SYNODIC_MONTH
     first_full_jd = t_birth.jd + days_to_first
-    if first_full_jd > t_ref.jd:
+    # t_ref.jd is midnight UTC; extend to the end of the ref day
+    # so full moons on that day are counted.
+    end_jd = t_ref.jd + 1.0
+    if first_full_jd >= end_jd:
         return 0
-    return int((t_ref.jd - first_full_jd) / SYNODIC_MONTH) + 1
+    return int((end_jd - first_full_jd) / SYNODIC_MONTH) + 1
+
+
+def next_full_moon(ref: date) -> str:
+    """Date of the first full moon on or after *ref*.
+
+    Uses the same mean synodic model as ``count_full_moons``,
+    anchored at midnight UTC of *ref*; the modelled instant can
+    differ from the true instant by a few hours.
+
+    Args:
+        ref: Reference date.
+
+    Returns:
+        ISO ``YYYY-MM-DD`` date string.
+    """
+    t_ref = Time(ref.isoformat(), format="iso")
+    ref_age = (t_ref.jd - NEW_MOON_JD) % SYNODIC_MONTH
+    days_to = (14.765 - ref_age) % SYNODIC_MONTH
+    return format_arrival_date(ref, days_to)
+
+
+def zodiac_sign_for(d: date) -> str:
+    """Tropical (astrological) zodiac sign for a calendar date.
+
+    Args:
+        d: The date to look up.
+
+    Returns:
+        Sign name, e.g. ``"Sagittarius"``.
+    """
+    for start_month, start_day, sign in reversed(ZODIAC_SIGNS):
+        if (d.month, d.day) >= (start_month, start_day):
+            return sign
+    # Before 20 January: Capricorn wraps the year boundary.
+    return ZODIAC_SIGNS[-1][2]
+
+
+def compute_sun_constellation(d: date) -> SunConstellation:
+    """Locate the Sun on the sky for a birthday.
+
+    Compares the IAU constellation actually containing the Sun
+    (at midnight UTC) with the traditional zodiac sign for the
+    date. They usually differ: the signs were fixed about 2,000
+    years ago and axial precession has since shifted the Sun's
+    apparent path by roughly one constellation.
+
+    Args:
+        d: The date to evaluate.
+
+    Returns:
+        A ``SunConstellation`` with both answers and whether
+        they agree.
+    """
+    t = Time(d.isoformat(), format="iso")
+    sun = get_body("sun", t)
+    constellation = str(get_constellation(sun))
+    # astropy's constellation name table misspells Ophiuchus.
+    if constellation == "Ophiucus":
+        constellation = "Ophiuchus"
+    sign = zodiac_sign_for(d)
+    equivalent = SIGN_CONSTELLATIONS.get(sign, sign)
+    return SunConstellation(
+        constellation=constellation,
+        zodiac_sign=sign,
+        matches_zodiac_sign=(constellation == equivalent),
+    )
+
+
+# One Gregorian 400-year cycle: used to format arrival dates
+# beyond year 9999, which ``datetime.date`` cannot represent.
+_GREGORIAN_CYCLE_DAYS = 146_097
+_MAX_ORDINAL = date.max.toordinal()
+
+
+def format_arrival_date(base: date, days_after: float) -> str:
+    """Format ``base + days_after`` as an ISO calendar date.
+
+    Uses plain date arithmetic (roughly 75x cheaper than
+    building an astropy ``Time`` per star) and produces
+    well-formed dates for every reachable year: years below
+    1000 are zero-padded to four digits, and years beyond 9999
+    (which ``datetime.date`` cannot hold) are computed by
+    shifting back whole 400-year Gregorian cycles.
+
+    Args:
+        base: Starting date.
+        days_after: Non-negative day offset; fractions of a day
+            are truncated, matching a midnight-based timestamp.
+
+    Returns:
+        An ISO ``YYYY-MM-DD`` string (five-digit year beyond
+        year 9999).
+    """
+    ordinal = base.toordinal() + int(days_after)
+    if ordinal <= _MAX_ORDINAL:
+        return date.fromordinal(ordinal).isoformat()
+    cycles = -(-(ordinal - _MAX_ORDINAL) // _GREGORIAN_CYCLE_DAYS)
+    shifted = date.fromordinal(
+        ordinal - cycles * _GREGORIAN_CYCLE_DAYS,
+    )
+    return (
+        f"{shifted.year + cycles * 400}"
+        f"-{shifted.month:02d}-{shifted.day:02d}"
+    )
 
 
 def find_birthday_star(
     radius_ly: float,
-    all_stars: list[dict],
+    all_stars: list[dict[str, Any]],
 ) -> BirthdayStar | None:
     """Find the star whose distance best matches the user's age.
 
@@ -343,6 +477,17 @@ def count_eclipses(birth: date, ref: date) -> EclipseCounts:
     hi_l = bisect.bisect_right(LUNAR_ECLIPSE_DATES, ref)
     lunar = hi_l - lo_l
 
+    # bisect_right already points at the first date strictly
+    # after ref, which is exactly the next upcoming eclipse.
+    next_solar = (
+        SOLAR_ECLIPSE_DATES[hi_s].isoformat()
+        if hi_s < len(SOLAR_ECLIPSE_DATES) else None
+    )
+    next_lunar = (
+        LUNAR_ECLIPSE_DATES[hi_l].isoformat()
+        if hi_l < len(LUNAR_ECLIPSE_DATES) else None
+    )
+
     note = None
     if birth < _ECLIPSE_START or ref > _ECLIPSE_END:
         covered_start = max(birth, _ECLIPSE_START)
@@ -358,6 +503,8 @@ def count_eclipses(birth: date, ref: date) -> EclipseCounts:
         solar_eclipses=solar,
         lunar_eclipses=lunar,
         total_eclipses=solar + lunar,
+        next_solar_eclipse=next_solar,
+        next_lunar_eclipse=next_lunar,
         coverage_note=note,
     )
 
@@ -512,6 +659,7 @@ def compute_first_light(
         result.full_moons_since_birth = count_full_moons(
             birth, ref,
         )
+        result.next_full_moon_date = next_full_moon(ref)
 
     if "light_sphere" in cats:
         radius_au = (radius_ly * u.lyr).to(u.AU).value
@@ -548,18 +696,22 @@ def compute_first_light(
         )
 
         if "stars" in cats:
-            not_reached = sorted(
-                [s for s in all_stars
-                 if s["distance_ly"] > radius_ly],
-                key=lambda s: s["distance_ly"],
+            # Counts come from the full reached set; the
+            # expensive per-star models are only built for the
+            # slice that will actually be returned.
+            naked_eye_count = sum(
+                1 for s in reached
+                if s["apparent_magnitude"] <= NAKED_EYE_MAG_LIMIT
             )
-            stars = []
-            for s in reached:
-                arrival_jd = (
-                    t_birth.jd + s["distance_ly"] * 365.25
-                )
-                arrival_time = Time(arrival_jd, format="jd")
-                stars.append(StarInfo(
+            truncated = (
+                star_limit is not None
+                and len(reached) > star_limit
+            )
+            returned = (
+                reached[:star_limit] if truncated else reached
+            )
+            stars = [
+                StarInfo(
                     name=s["name"],
                     distance_ly=round(s["distance_ly"], 2),
                     spectral_type=s["spectral_type"],
@@ -567,51 +719,63 @@ def compute_first_light(
                         s["spectral_type"],
                     ),
                     apparent_magnitude=s["apparent_magnitude"],
+                    magnitude_band=s.get("magnitude_band"),
                     known_exoplanets=s["known_exoplanets"],
                     your_age_at_light_arrival_years=round(
                         s["distance_ly"], 2,
                     ),
-                    light_arrival_date=arrival_time.iso[:10],
+                    light_arrival_date=format_arrival_date(
+                        birth, s["distance_ly"] * 365.25,
+                    ),
                     naked_eye_visible=(
                         s["apparent_magnitude"]
                         <= NAKED_EYE_MAG_LIMIT
                     ),
                     ra_deg=s.get("ra_deg"),
                     dec_deg=s.get("dec_deg"),
-                ))
-            naked_eye_count = sum(
-                1 for s in stars if s.naked_eye_visible
-            )
+                )
+                for s in returned
+            ]
 
             next_star = None
-            if not_reached:
-                ns = not_reached[0]
+            ns = min(
+                (s for s in all_stars
+                 if s["distance_ly"] > radius_ly),
+                key=lambda s: s["distance_ly"],
+                default=None,
+            )
+            if ns is not None:
                 arrives_in = ns["distance_ly"] - radius_ly
-                arrival_jd = t_ref.jd + arrives_in * 365.25
-                arrival_time = Time(arrival_jd, format="jd")
                 next_star = NextStar(
                     name=ns["name"],
                     distance_ly=round(ns["distance_ly"], 2),
                     arrives_in_years=round(arrives_in, 2),
-                    arrival_date=arrival_time.iso[:10],
+                    arrival_date=format_arrival_date(
+                        ref, arrives_in * 365.25,
+                    ),
                 )
 
             result.stars_reached = len(reached)
             result.naked_eye_stars_reached = naked_eye_count
+            # Stars first reached in the final year up to ref:
+            # the shell between last year's radius and today's.
+            year_ago_radius = max(0.0, radius_ly - 1.0)
+            result.stars_reached_this_year = sum(
+                1 for s in reached
+                if s["distance_ly"] > year_ago_radius
+            )
             result.birthday_star = find_birthday_star(
                 radius_ly, all_stars,
             )
-            if star_limit is not None and len(stars) > star_limit:
-                result.stars = stars[:star_limit]
-                remaining = len(stars) - star_limit
-                furthest = stars[-1].name
+            result.stars = stars
+            if star_limit is not None and truncated:
+                remaining = len(reached) - star_limit
+                furthest = reached[-1]["name"]
                 result.stars_remaining = (
                     f"Your light has reached {remaining} "
                     f"more star{'s' if remaining != 1 else ''}"
                     f", with the furthest being {furthest}."
                 )
-            else:
-                result.stars = stars
             result.next_star = next_star
 
         if "exoplanets" in cats:
@@ -658,7 +822,7 @@ def compute_first_light(
         )
         net_thermal = gross - ambient
         total_photons = (
-            (gross / AVG_IR_PHOTON_ENERGY_J) * age_seconds
+            (gross / MEAN_IR_PHOTON_ENERGY_J) * age_seconds
         )
         result.body_stats = BodyStats(
             estimated_heartbeats=int(
@@ -773,6 +937,11 @@ def compute_first_light(
     if "universe_perspective" in cats:
         result.universe_age_percent = round(
             (age_years / UNIVERSE_AGE_YEARS) * 100, 15,
+        )
+
+    if "sun_constellation" in cats:
+        result.sun_constellation = compute_sun_constellation(
+            birth,
         )
 
     if "voyagers" in cats:

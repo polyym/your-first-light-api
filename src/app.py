@@ -7,17 +7,21 @@ rate limiting, request logging, and structured error handling.
 
 import asyncio
 import logging
+import os
 import time
-from collections.abc import Callable
-from datetime import date, datetime
+from collections.abc import Awaitable, Callable, Sequence
+from datetime import date, datetime, timezone
+from typing import Any
 
 from fastapi import APIRouter, FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from starlette.responses import Response
 
 from src.compute import (
+    DATA_MANIFEST,
     NEARBY_STARS,
     SOLAR_ECLIPSE_DATES,
     compute_first_light,
@@ -41,21 +45,38 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Your First Light",
     description="Post your birthday. Discover your cosmic reach.",
-    version="1.0.0",
+    version="1.1.0",
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# NOTE: CORSMiddleware is registered at the bottom of this module,
+# after the rate-limiting and logging middleware, so that it wraps
+# them and 429 responses also carry CORS headers.
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 
 # -------------------------------------------------------------------
-# Global exception handler
+# Global exception handlers
 # -------------------------------------------------------------------
+def _cors_headers(request: Request) -> dict[str, str]:
+    """CORS headers for responses produced outside the middleware.
+
+    The 500 handler runs in Starlette's outermost
+    ``ServerErrorMiddleware``, so its response never passes
+    through ``CORSMiddleware``.  Because the API allows all
+    origins without credentials, a static wildcard is correct.
+
+    Args:
+        request: The incoming HTTP request.
+
+    Returns:
+        CORS headers when the request is cross-origin,
+        otherwise an empty dict.
+    """
+    if "origin" in request.headers:
+        return {"Access-Control-Allow-Origin": "*"}
+    return {}
+
+
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(
     request: Request,
@@ -76,19 +97,72 @@ async def unhandled_exception_handler(
     return JSONResponse(
         status_code=500,
         content={"detail": "An unexpected error occurred."},
+        headers=_cors_headers(request),
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(
+    request: Request,
+    exc: RequestValidationError,
+) -> JSONResponse:
+    """Normalise Pydantic validation errors to the documented shape.
+
+    FastAPI's default 422 body carries ``detail`` as a list of
+    error objects, which contradicts the published
+    ``ErrorResponse`` schema (a plain string).  This handler
+    flattens the first validation error into a single
+    human-readable message so every 422 has the same shape.
+
+    Args:
+        request: The incoming HTTP request.
+        exc: The validation error raised by Pydantic.
+
+    Returns:
+        A 422 JSON response with ``detail`` as a string.
+    """
+    errors = exc.errors()
+    if errors:
+        first = errors[0]
+        loc = ".".join(
+            str(part) for part in first.get("loc", ())
+            if part != "body"
+        )
+        msg = first.get("msg", "Invalid request.")
+        detail = f"{loc}: {msg}" if loc else msg
+    else:
+        detail = "Invalid request."
+    return JSONResponse(
+        status_code=422,
+        content={"detail": detail},
     )
 
 
 # -------------------------------------------------------------------
-# Client IP extraction (proxy-aware)
+# Client IP extraction (proxy-aware, opt-in)
 # -------------------------------------------------------------------
-def _get_client_ip(request: Request) -> str:
-    """Extract the real client IP from the request.
+# Number of trusted reverse proxies between the client and this
+# app.  0 (the default) means the port is directly exposed and
+# X-Forwarded-For is entirely attacker-supplied, so it is ignored
+# and the direct peer address is used.  Behind Render or another
+# proxy chain, set TRUSTED_PROXY_HOPS to the number of proxy hops
+# so the entry appended by the first trusted proxy is selected.
+TRUSTED_PROXY_HOPS = int(
+    os.environ.get("TRUSTED_PROXY_HOPS", "0"),
+)
 
-    Uses the **rightmost** ``X-Forwarded-For`` entry — the one
-    added by our own reverse proxy (Render, CloudFlare, etc.).
-    The leftmost entry is client-supplied and trivially spoofable,
-    so it must never be trusted for rate limiting.
+
+def _get_client_ip(request: Request) -> str:
+    """Extract the client IP used for rate limiting and logging.
+
+    With ``TRUSTED_PROXY_HOPS`` set to N > 0, each of the N
+    trusted proxies appends the address of the peer it accepted,
+    so the real client is the Nth entry from the right of
+    ``X-Forwarded-For``.  Anything further left is
+    client-supplied and trivially spoofable, so it is never
+    consulted.  With the default of 0 the header is ignored
+    completely, because a directly exposed port makes the whole
+    header attacker-controlled.
 
     Args:
         request: The incoming HTTP request.
@@ -96,11 +170,20 @@ def _get_client_ip(request: Request) -> str:
     Returns:
         Client IP string, or ``"unknown"`` when unavailable.
     """
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        # X-Forwarded-For: client, proxy1, proxy2
-        # Rightmost = added by our trusted edge proxy.
-        return forwarded.split(",")[-1].strip()
+    hops = TRUSTED_PROXY_HOPS
+    if hops > 0:
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            entries = [
+                e.strip() for e in forwarded.split(",")
+                if e.strip()
+            ]
+            if len(entries) >= hops:
+                return entries[-hops]
+            if entries:
+                # Shorter chain than configured: the request
+                # bypassed some proxies; use the outermost entry.
+                return entries[0]
     if request.client:
         return request.client.host
     return "unknown"
@@ -126,13 +209,16 @@ _RATE_LIMITED_PATHS = {
 @app.middleware("http")
 async def rate_limit_middleware(
     request: Request,
-    call_next: Callable[[Request], Response],
+    call_next: Callable[[Request], Awaitable[Response]],
 ) -> Response:
     """Enforce per-IP rate limiting on POST endpoints.
 
     Allows one request per ``RATE_LIMIT_SECONDS`` per client IP
     on rate-limited paths.  Stale entries are evicted on each
-    invocation to prevent unbounded memory growth.
+    invocation to prevent unbounded memory growth.  A request
+    that fails downstream (4xx/5xx, e.g. a date-format mistake)
+    releases its slot again, so a corrected retry is not
+    punished with a 429.
 
     Args:
         request: The incoming HTTP request.
@@ -174,7 +260,18 @@ async def rate_limit_middleware(
                     "Retry-After": str(int(wait) + 1),
                 },
             )
+        # Record before awaiting so concurrent requests from the
+        # same IP cannot all pass the check at once, then refund
+        # the slot if this request turns out to be an error.
         _rate_limit[client_ip] = now
+        try:
+            response = await call_next(request)
+        except Exception:
+            _rate_limit.pop(client_ip, None)
+            raise
+        if response.status_code >= 400:
+            _rate_limit.pop(client_ip, None)
+        return response
     return await call_next(request)
 
 
@@ -184,9 +281,14 @@ async def rate_limit_middleware(
 @app.middleware("http")
 async def request_logging_middleware(
     request: Request,
-    call_next: Callable[[Request], Response],
+    call_next: Callable[[Request], Awaitable[Response]],
 ) -> Response:
     """Log every request with method, path, status, and duration.
+
+    Requests that raise are logged as 500 before the exception
+    propagates to the outermost error middleware, so failed
+    requests still appear in the access log with their duration
+    and client IP.
 
     Args:
         request: The incoming HTTP request.
@@ -196,17 +298,37 @@ async def request_logging_middleware(
         The downstream response, unmodified.
     """
     start = time.monotonic()
-    response = await call_next(request)
-    elapsed_ms = (time.monotonic() - start) * 1000
-    logger.info(
-        "%s %s %s %.0fms %s",
-        request.method,
-        request.url.path,
-        response.status_code,
-        elapsed_ms,
-        _get_client_ip(request),
-    )
-    return response
+    status = 500
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        return response
+    finally:
+        elapsed_ms = (time.monotonic() - start) * 1000
+        logger.info(
+            "%s %s %s %.0fms %s",
+            request.method,
+            request.url.path,
+            status,
+            elapsed_ms,
+            _get_client_ip(request),
+        )
+
+
+# -------------------------------------------------------------------
+# CORS — registered last so it is the OUTERMOST user middleware.
+# Starlette wraps middleware in reverse registration order, so
+# adding CORS here means 429s from the rate limiter (and every
+# other middleware response) also carry CORS headers.  Responses
+# from the 500 handler run outside all user middleware and get
+# their CORS headers from ``_cors_headers`` instead.
+# -------------------------------------------------------------------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # -------------------------------------------------------------------
@@ -250,6 +372,26 @@ def parse_little_endian(s: str) -> date:
 
 
 # -------------------------------------------------------------------
+# Root index (root level — no version prefix, not rate limited)
+# -------------------------------------------------------------------
+@app.get("/")
+def index() -> dict[str, object]:
+    """Small JSON index so the base URL is not a bare 404.
+
+    Returns:
+        A dict with the API name, version, and useful paths.
+    """
+    return {
+        "name": app.title,
+        "version": app.version,
+        "description": app.description,
+        "docs_url": "/docs",
+        "health_url": "/health",
+        "endpoints": sorted(_RATE_LIMITED_PATHS),
+    }
+
+
+# -------------------------------------------------------------------
 # Health (root level — no version prefix)
 # -------------------------------------------------------------------
 @app.get("/health")
@@ -258,16 +400,25 @@ def health() -> dict[str, object]:
 
     Returns:
         A dict with ``status`` (``"ok"`` or ``"degraded"``),
-        ``stars_loaded``, and ``eclipses_loaded`` counts.
+        ``stars_loaded`` and ``eclipses_loaded`` counts, and,
+        when data/manifest.json exists, a ``data_updated``
+        mapping of data file to the date it last changed.
     """
     stars = len(NEARBY_STARS)
     eclipses = len(SOLAR_ECLIPSE_DATES)
     ok = stars > 0 and eclipses > 0
-    return {
+    payload: dict[str, object] = {
         "status": "ok" if ok else "degraded",
         "stars_loaded": stars,
         "eclipses_loaded": eclipses,
     }
+    manifest_files = DATA_MANIFEST.get("files", {})
+    if manifest_files:
+        payload["data_updated"] = {
+            name: info.get("updated")
+            for name, info in manifest_files.items()
+        }
+    return payload
 
 
 # -------------------------------------------------------------------
@@ -276,7 +427,7 @@ def health() -> dict[str, object]:
 async def _handle(
     birthday_str: str,
     as_of_str: str | None,
-    categories: list[str] | None,
+    categories: Sequence[str] | None,
     star_limit: int,
     parser: Callable[[str], date],
 ) -> FirstLightResponse:
@@ -302,7 +453,9 @@ async def _handle(
             status_code=422, detail=str(e),
         )
 
-    ref = date.today()
+    # The default reference date is the current UTC date, which
+    # can differ from the caller's local date around midnight.
+    ref = datetime.now(timezone.utc).date()
     if as_of_str:
         try:
             ref = parser(as_of_str)
@@ -317,7 +470,12 @@ async def _handle(
             detail="Birthday must be in the past.",
         )
 
-    cats = set(categories) if categories else ALL_CATEGORIES
+    # categories is either None (all) or a non-empty list; the
+    # request models reject an explicit empty list with a 422.
+    cats = (
+        set(categories) if categories is not None
+        else ALL_CATEGORIES
+    )
     return await asyncio.to_thread(
         compute_first_light, birth, ref, cats, star_limit,
     )
@@ -328,10 +486,13 @@ async def _handle(
 # -------------------------------------------------------------------
 router = APIRouter(prefix="/v1")
 
-_ERROR_RESPONSES = {
+_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
     422: {
         "model": ErrorResponse,
-        "description": "Invalid or future date.",
+        "description": (
+            "Invalid or future date, or invalid request "
+            "fields (all 422s use this shape)."
+        ),
     },
     429: {
         "model": RateLimitResponse,
@@ -420,10 +581,12 @@ app.include_router(router)
 if __name__ == "__main__":
     import uvicorn
 
+    # Proxy headers are handled by _get_client_ip via the
+    # TRUSTED_PROXY_HOPS setting, not by uvicorn: trusting
+    # X-Forwarded-For from any peer would let clients spoof
+    # their rate-limit identity on a directly exposed port.
     uvicorn.run(
         "src.app:app",
         host="0.0.0.0",
-        port=8000,
-        proxy_headers=True,
-        forwarded_allow_ips="*",
+        port=int(os.environ.get("PORT", "8000")),
     )

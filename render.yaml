@@ -4,3 +4,12 @@ services:
     runtime: docker
     plan: free
     healthCheckPath: /health
+    envVars:
+      # Pin the port rather than relying on Render's
+      # best-effort detection; the Dockerfile CMD reads it.
+      - key: PORT
+        value: "8000"
+      # Render terminates TLS and proxies requests, so trust
+      # one X-Forwarded-For hop when extracting client IPs.
+      - key: TRUSTED_PROXY_HOPS
+        value: "1"

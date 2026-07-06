@@ -8,10 +8,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 # Install dependencies first (layer caching).
-# requirements.txt is the Docker cache key — keep it in sync
-# with pyproject.toml [project.dependencies].
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# requirements.lock is fully pinned (generated with uv pip
+# compile from pyproject.toml) so image builds are reproducible.
+COPY requirements.lock .
+RUN pip install --no-cache-dir -r requirements.lock
 
 # Copy application code and data
 COPY src/ src/
@@ -21,14 +21,18 @@ COPY data/ data/
 RUN useradd --create-home appuser
 USER appuser
 
-# Warm the astropy ephemeris cache AS appuser so the cache
-# lands in /home/appuser/.astropy/ where the app can read it.
-RUN python -c "\
-from astropy.coordinates import get_body; \
-from astropy.time import Time; \
-get_body('moon', Time.now()); \
-print('Ephemeris cache warmed')"
-
 EXPOSE 8000
 
-CMD ["uvicorn", "src.app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--proxy-headers", "--forwarded-allow-ips", "*"]
+# Moon/Sun positions use astropy's built-in analytical ephemeris
+# (ERFA); nothing is downloaded at runtime, so no cache warming
+# is needed.
+#
+# X-Forwarded-For is handled in-app: set TRUSTED_PROXY_HOPS to
+# the number of reverse proxies in front of the container
+# (e.g. 1 behind a single proxy). The default of 0 ignores the
+# header, which is correct when the port is exposed directly.
+#
+# Shell form so ${PORT} from the platform (e.g. Render) is
+# honoured, defaulting to 8000 locally; exec replaces the shell
+# so uvicorn is PID 1 and receives SIGTERM for graceful stops.
+CMD exec uvicorn src.app:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1

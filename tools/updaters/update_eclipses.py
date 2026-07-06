@@ -6,15 +6,17 @@ Scrapes solar and lunar eclipse dates from NASA GSFC, validates the
 data, and writes data/eclipses.json. No external dependencies beyond
 the Python standard library.
 
-Run locally whenever you want fresh data, then commit and push:
+Normally run via the scheduled data-refresh workflow or the single
+entry point:
 
-    python tools/update_eclipses.py
-    git add data/eclipses.json
-    git commit -m "Refresh eclipse catalogue"
-    git push
+    python tools/update_data.py eclipses
+
+The write is atomic and only happens when the content changed;
+validation failures exit non-zero without touching the data file.
 """
 
 import json
+import os
 import re
 import sys
 import urllib.error
@@ -211,15 +213,27 @@ def validate(
                 f"apart (minimum ~29.5)"
             )
 
-    # Every year 1900-2100 has at least 2 solar eclipses
+    # Every year 1900-2100 has at least 2 eclipses of each kind
+    # (the catalogue includes penumbral lunar eclipses, so the
+    # floor holds for both). This catches a single century page
+    # failing to fetch, which barely moves the total counts.
     solar_by_year: dict[int, int] = {}
     for d in solar:
         solar_by_year[d.year] = solar_by_year.get(d.year, 0) + 1
+    lunar_by_year: dict[int, int] = {}
+    for d in lunar:
+        lunar_by_year[d.year] = lunar_by_year.get(d.year, 0) + 1
     for y in range(START_YEAR, END_YEAR + 1):
         count = solar_by_year.get(y, 0)
         if count < 2:
             errors.append(
                 f"Year {y} has only {count} solar eclipse(s) "
+                f"(expected >= 2)"
+            )
+        count = lunar_by_year.get(y, 0)
+        if count < 2:
+            errors.append(
+                f"Year {y} has only {count} lunar eclipse(s) "
                 f"(expected >= 2)"
             )
 
@@ -252,12 +266,27 @@ def validate(
 # ---------------------------------------------------------------------------
 # Write output
 # ---------------------------------------------------------------------------
-def write_eclipses(solar: list[date], lunar: list[date]) -> None:
+def write_eclipses(
+    solar: list[date],
+    lunar: list[date],
+    output_path: Path | None = None,
+) -> bool:
     """Write the eclipse catalogue to ``data/eclipses.json``.
+
+    The file is written to a temporary sibling and moved into
+    place with ``os.replace`` so an interrupted run can never
+    leave a truncated catalogue behind.  When the eclipse dates
+    are identical to the file already on disk, nothing is
+    written (the ``generated`` stamp is deliberately kept as it
+    was, so refresh runs do not churn the file).
 
     Args:
         solar: Validated solar eclipse dates.
         lunar: Validated lunar eclipse dates.
+        output_path: Override the destination (used by tests).
+
+    Returns:
+        ``True`` when the file on disk changed.
     """
     output = {
         "source": (
@@ -275,16 +304,46 @@ def write_eclipses(solar: list[date], lunar: list[date]) -> None:
         "lunarEclipses": [d.isoformat() for d in lunar],
     }
 
-    output_path = (
-        Path(__file__).resolve().parent.parent.parent
-        / "data"
-        / "eclipses.json"
+    if output_path is None:
+        output_path = (
+            Path(__file__).resolve().parent.parent.parent
+            / "data"
+            / "eclipses.json"
+        )
+
+    if output_path.exists():
+        try:
+            existing = json.loads(
+                output_path.read_text(encoding="utf-8"),
+            )
+        except (OSError, json.JSONDecodeError):
+            existing = None
+        if (
+            existing is not None
+            and existing.get("solarEclipses")
+            == output["solarEclipses"]
+            and existing.get("lunarEclipses")
+            == output["lunarEclipses"]
+        ):
+            print(
+                f"\n{output_path.name} unchanged "
+                f"({len(solar) + len(lunar)} eclipses); "
+                f"not rewritten"
+            )
+            return False
+
+    tmp_path = output_path.with_name(output_path.name + ".tmp")
+    # newline="\n" keeps output byte-identical across platforms
+    # (Windows text mode would otherwise write CRLF).
+    tmp_path.write_text(
+        json.dumps(output, indent=2), encoding="utf-8",
+        newline="\n",
     )
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(output, f, indent=2)
+    os.replace(tmp_path, output_path)
 
     print(f"\nWrote {len(solar) + len(lunar)} eclipses "
           f"to {output_path}")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +374,7 @@ def main() -> None:
         sys.exit(1)
 
     print("\nValidation passed")
-    write_eclipses(solar, lunar)
+    changed = write_eclipses(solar, lunar)
 
     # Summary
     print("\nSummary:")
@@ -324,10 +383,11 @@ def main() -> None:
     print(f"  Total: {len(solar) + len(lunar)}")
 
     print()
-    print("Done! Now commit and push:")
-    print("  git add data/eclipses.json")
-    print('  git commit -m "Refresh eclipse catalogue"')
-    print("  git push")
+    if changed:
+        print("Done! Review the diff, then commit data/eclipses.json")
+        print("(the scheduled workflow does this via a pull request).")
+    else:
+        print("Done! Catalogue already up to date.")
 
 
 if __name__ == "__main__":

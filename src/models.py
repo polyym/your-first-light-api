@@ -27,6 +27,7 @@ Category = Literal[
     "voyagers",
     "eclipses",
     "links",
+    "sun_constellation",
 ]
 
 ALL_CATEGORIES: set[str] = set(get_args(Category))
@@ -77,7 +78,8 @@ class _BaseRequest(BaseModel):
 
     Attributes:
         categories: Optional list of category names to include in
-            the response.  Omit to receive all categories.
+            the response.  Omit to receive all categories.  An
+            explicit empty list is rejected with a 422.
         star_limit: Maximum number of stars to return in the
             ``stars`` list (default 500).  Counts and
             ``next_star`` are always computed from the full
@@ -86,8 +88,12 @@ class _BaseRequest(BaseModel):
 
     categories: list[Category] | None = Field(
         None,
-        description="Categories to include. Omit for all.",
-        max_length=14,
+        description=(
+            "Categories to include. Omit for all. "
+            "Must not be empty when provided."
+        ),
+        min_length=1,
+        max_length=15,
     )
     star_limit: int = Field(
         500,
@@ -114,7 +120,10 @@ class BigEndianRequest(_BaseRequest):
     )
     as_of: str | None = Field(
         None,
-        description="Reference date in YYYY-MM-DD (defaults to today).",
+        description=(
+            "Reference date in YYYY-MM-DD "
+            "(defaults to the current UTC date)."
+        ),
         max_length=10,
     )
 
@@ -130,7 +139,10 @@ class MiddleEndianRequest(_BaseRequest):
     )
     as_of: str | None = Field(
         None,
-        description="Reference date in MM/DD/YYYY (defaults to today).",
+        description=(
+            "Reference date in MM/DD/YYYY "
+            "(defaults to the current UTC date)."
+        ),
         max_length=10,
     )
 
@@ -146,7 +158,10 @@ class LittleEndianRequest(_BaseRequest):
     )
     as_of: str | None = Field(
         None,
-        description="Reference date in DD/MM/YYYY (defaults to today).",
+        description=(
+            "Reference date in DD/MM/YYYY "
+            "(defaults to the current UTC date)."
+        ),
         max_length=10,
     )
 
@@ -170,6 +185,9 @@ class StarInfo(BaseModel):
         naked_eye_visible: Whether the star is visible unaided.
         ra_deg: Right ascension in decimal degrees (J2000).
         dec_deg: Declination in decimal degrees (J2000).
+        magnitude_band: Photometric band of
+            ``apparent_magnitude`` (``"V"`` or ``"G"``), when
+            known.
     """
 
     name: str
@@ -179,6 +197,14 @@ class StarInfo(BaseModel):
         ..., description="Human-friendly star classification",
     )
     apparent_magnitude: float
+    magnitude_band: str | None = Field(
+        None,
+        description=(
+            "Photometric band of apparent_magnitude: 'V' "
+            "(visual) or 'G' (Gaia broad-band, used when no "
+            "V estimate exists). Omitted when unknown."
+        ),
+    )
     known_exoplanets: int
     your_age_at_light_arrival_years: float = Field(
         ...,
@@ -192,7 +218,9 @@ class StarInfo(BaseModel):
         ...,
         description=(
             "Calendar date (YYYY-MM-DD) when light from "
-            "your birth first reached this star"
+            "your birth first reached this star. Years "
+            "are zero-padded to four digits; arrivals "
+            "beyond year 9999 use five digits."
         ),
     )
     naked_eye_visible: bool
@@ -315,8 +343,9 @@ class CosmicJourney(BaseModel):
             galactic centre.
         great_attractor_distance_km: Distance the Milky Way has
             moved toward the Great Attractor since birth.
-        universe_expansion_percent: Fractional expansion of the
-            observable universe since birth.
+        universe_expansion_percent: Percentage growth of the
+            cosmological scale factor since birth (first-order
+            Hubble expansion).
     """
 
     earth_distance_around_sun_km: float
@@ -333,8 +362,9 @@ class CosmicJourney(BaseModel):
     universe_expansion_percent: float = Field(
         ...,
         description=(
-            "Fractional expansion of the observable "
-            "universe since birth"
+            "Percentage growth of the cosmological scale "
+            "factor since birth (first-order Hubble "
+            "expansion, H0 x age)"
         ),
     )
 
@@ -409,6 +439,44 @@ class BirthdayStar(BaseModel):
     )
 
 
+class SunConstellation(BaseModel):
+    """Where the Sun actually was on the user's birthday.
+
+    Attributes:
+        constellation: IAU constellation containing the Sun at
+            midnight UTC on the birthday.
+        zodiac_sign: Traditional (tropical) astrological sign
+            for the date.
+        matches_zodiac_sign: Whether the two agree. Usually
+            ``False``: roughly 2,000 years of axial precession
+            has shifted the Sun's apparent path by about one
+            constellation since the signs were fixed.
+    """
+
+    constellation: str = Field(
+        ...,
+        description=(
+            "IAU constellation the Sun was actually in at "
+            "midnight UTC on your birthday (one of 13, "
+            "including Ophiuchus)."
+        ),
+    )
+    zodiac_sign: str = Field(
+        ...,
+        description=(
+            "Traditional (tropical) star sign for the date."
+        ),
+    )
+    matches_zodiac_sign: bool = Field(
+        ...,
+        description=(
+            "Whether the actual constellation matches the "
+            "sign. Usually false, thanks to ~2,000 years of "
+            "axial precession."
+        ),
+    )
+
+
 class VoyagerStatus(BaseModel):
     """Distance a Voyager probe has covered since the user's birth.
 
@@ -437,6 +505,10 @@ class EclipseCounts(BaseModel):
         solar_eclipses: Number of solar eclipses.
         lunar_eclipses: Number of lunar eclipses.
         total_eclipses: Combined count (solar + lunar).
+        next_solar_eclipse: Date of the first solar eclipse
+            strictly after the reference date.
+        next_lunar_eclipse: Date of the first lunar eclipse
+            strictly after the reference date.
         coverage_note: Present only when the date range extends
             outside the catalogue's 1900–2100 window.
     """
@@ -444,6 +516,22 @@ class EclipseCounts(BaseModel):
     solar_eclipses: int
     lunar_eclipses: int
     total_eclipses: int
+    next_solar_eclipse: str | None = Field(
+        None,
+        description=(
+            "Date (YYYY-MM-DD) of the first solar eclipse "
+            "strictly after as_of. Omitted when as_of is "
+            "beyond the catalogue window (2100)."
+        ),
+    )
+    next_lunar_eclipse: str | None = Field(
+        None,
+        description=(
+            "Date (YYYY-MM-DD) of the first lunar eclipse "
+            "strictly after as_of. Omitted when as_of is "
+            "beyond the catalogue window (2100)."
+        ),
+    )
     coverage_note: str | None = Field(
         None,
         description=(
@@ -463,15 +551,24 @@ class FirstLightResponse(BaseModel):
 
     All category-specific fields default to ``None`` and are
     excluded from the JSON response via
-    ``response_model_exclude_none=True`` when not requested.
+    ``response_model_exclude_none=True``.  A field is therefore
+    omitted both when its category was not requested AND when
+    it has no value within a requested category (for example
+    ``birthday_star`` when no star matches within tolerance,
+    ``next_star`` when every catalogued star has been reached,
+    or ``stars_remaining`` when the list was not truncated).
     The ``birthday`` and ``as_of`` fields are always present.
     """
 
     model_config = {
         "json_schema_extra": {
             "description": (
-                "All category fields are optional. "
-                "Only requested categories are populated."
+                "All category fields are optional. Only "
+                "requested categories are populated, and a "
+                "field is also omitted when it has no value "
+                "within a requested category (e.g. "
+                "birthday_star with no match, next_star when "
+                "all stars are reached)."
             ),
         },
     }
@@ -498,6 +595,16 @@ class FirstLightResponse(BaseModel):
     # moon
     moon_phase_at_midnight_utc: MoonPhaseAtBirth | None = None
     full_moons_since_birth: int | None = None
+    next_full_moon_date: str | None = Field(
+        None,
+        description=(
+            "Date (YYYY-MM-DD) of the first full moon on "
+            "or after as_of, from the same mean synodic "
+            "model as the full-moon count (the modelled "
+            "instant can differ from the true instant by "
+            "a few hours)."
+        ),
+    )
 
     # light_sphere
     light_sphere: LightSphere | None = None
@@ -506,6 +613,13 @@ class FirstLightResponse(BaseModel):
     # stars
     stars_reached: int | None = None
     naked_eye_stars_reached: int | None = None
+    stars_reached_this_year: int | None = Field(
+        None,
+        description=(
+            "Catalogue stars your birth light reached in "
+            "the 365.25 days up to as_of."
+        ),
+    )
     stars_remaining: str | None = Field(
         None,
         description=(
@@ -519,11 +633,20 @@ class FirstLightResponse(BaseModel):
         None,
         description=(
             "The star whose distance most closely "
-            "matches your age in light-years"
+            "matches your age in light-years. Omitted "
+            "when no star is within 2 light-years of "
+            "your age."
         ),
     )
     stars: list[StarInfo] | None = None
-    next_star: NextStar | None = None
+    next_star: NextStar | None = Field(
+        None,
+        description=(
+            "The nearest star your light has not yet "
+            "reached. Omitted when every star in the "
+            "catalogue has been reached."
+        ),
+    )
 
     # exoplanets
     estimated_exoplanets: int | None = None
@@ -561,6 +684,9 @@ class FirstLightResponse(BaseModel):
             "universe's age (13.787 billion years)"
         ),
     )
+
+    # sun_constellation
+    sun_constellation: SunConstellation | None = None
 
     # voyagers
     voyagers: list[VoyagerStatus] | None = None
