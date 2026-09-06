@@ -3,8 +3,10 @@
 update_stars.py — Refresh stars.json from multiple astronomical catalogues.
 
 Queries HIPPARCOS, Gliese Catalogue of Nearby Stars, and Gaia DR3 via Vizier,
-plus the NASA Exoplanet Archive for planet counts. Merges and deduplicates
-results to produce the most complete nearby star catalogue possible.
+plus the NASA Exoplanet Archive for planet counts. Every position is
+propagated to epoch J2000.0 from the catalogue's own astrometry before the
+catalogues are merged and deduplicated into the most complete nearby star
+catalogue possible.
 
 Normally run via the scheduled data-refresh workflow or the single
 entry point:
@@ -22,6 +24,9 @@ import os
 import sys
 from pathlib import Path
 
+import erfa
+import numpy as np
+
 MAX_RADIUS_LY = 160  # covers anyone up to ~160 years old
 MIN_PARALLAX_SNR = 5  # reject stars where Plx / e_Plx < this
 
@@ -30,17 +35,31 @@ MIN_PARALLAX_SNR = 5  # reject stars where Plx / e_Plx < this
 #
 # Tier 1 (same position): cross-catalogue entries within COINCIDENT_SEP_ARCSEC
 # are the same physical star REGARDLESS of how much their distances disagree.
-# With ~26k stars on the whole sky the expected number of chance alignments
-# this close is below one, while Gliese photometric parallaxes and faint-end
-# HIPPARCOS parallaxes routinely disagree with Gaia by 10-80 percent, so a
-# distance test here creates duplicates instead of preventing them.
+# With ~55k stars on the whole sky the expected number of chance alignments
+# this close is well below one, while Gliese photometric parallaxes and
+# faint-end HIPPARCOS parallaxes routinely disagree with Gaia by 10-80
+# percent, so a distance test here creates duplicates instead of preventing
+# them. When either position comes from the Gliese catalogue the radius is
+# GLIESE_COINCIDENT_SEP_ARCSEC instead: its positions are quantised to a
+# second of time and carry fifty years of proper motion from a catalogue
+# whose motions for faint stars are good to a few tenths of an arcsecond per
+# year, so the same star routinely lands 15-30 arcsec from its Gaia entry.
+# The expected number of chance alignments at 30 arcsec is still below one.
 #
-# Tier 2 (proper-motion window): between COINCIDENT_SEP_ARCSEC and
-# MERGE_MAX_SEP_DEG (which absorbs epoch drift for fast movers like
-# Barnard's Star, ~0.07 deg between the HIPPARCOS and Gaia epochs) the
-# distances must also agree within a distance-scaled tolerance, because a
-# window this wide contains genuinely unrelated stars.
+# Tier 2 (wide window): between COINCIDENT_SEP_ARCSEC and
+# MERGE_MAX_SEP_DEG the distances must also agree within a distance-scaled
+# tolerance, because a window this wide contains genuinely unrelated stars.
+# Every source is propagated to epoch J2000.0 before matching, so this
+# window exists only to absorb the Gliese catalogue's coarse positions (one
+# second of time in RA, 0.1 arcmin in Dec, plus fifty years of proper
+# motion applied from a PA quoted to 0.1 deg). It never applies between
+# two entries whose positions both come from HIPPARCOS or Gaia: at a common
+# epoch those agree to well under an arcsecond for the same star, so two
+# such positions further apart than tier 1 are two stars, typically a wide
+# companion at the same distance (Epsilon Indi A and its brown-dwarf pair,
+# 400 arcsec apart, used to be merged this way).
 COINCIDENT_SEP_ARCSEC = 15.0
+GLIESE_COINCIDENT_SEP_ARCSEC = 30.0
 MERGE_MAX_SEP_DEG = 0.15  # 540 arcsec
 
 # Tier 2 distance agreement scales with distance, because parallax
@@ -100,6 +119,200 @@ def check_fetch_counts(counts: dict[str, int]) -> list[str]:
     return errors
 
 
+# ---------------------------------------------------------------------------
+# Coordinate epochs
+#
+# The API publishes ICRS positions at epoch J2000.0. Every source catalogue
+# records positions at its own epoch (HIPPARCOS J1991.25, Gaia DR3 J2016.0,
+# Gliese B1950.0), and nearby stars move fast enough (Barnard's Star ~10
+# arcsec/yr) that the difference amounts to tens to hundreds of arcseconds.
+# The updater therefore reads each catalogue's native position and proper
+# motion columns and propagates them to J2000.0 itself, instead of relying
+# on VizieR's computed _RAJ2000/_DEJ2000 columns. In 2026 VizieR silently
+# stopped applying proper motion to those columns for the Gliese catalogue,
+# which shifted every fast-moving Gliese star by decades of motion, broke
+# the cross-catalogue match and duplicated ~300 nearby stars in one refresh
+# without tripping a single check.
+# ---------------------------------------------------------------------------
+J2000_JD = 2451545.0
+B1950_JD = 2433282.4235  # Besselian epoch B1950.0
+HIPPARCOS_EPOCH_JD = J2000_JD + (1991.25 - 2000.0) * 365.25
+GAIA_DR3_EPOCH_JD = J2000_JD + (2016.0 - 2000.0) * 365.25
+
+
+def propagate_to_j2000(
+    ra_deg: np.ndarray,
+    dec_deg: np.ndarray,
+    pmra_masyr: np.ndarray,
+    pmde_masyr: np.ndarray,
+    plx_mas: np.ndarray,
+    epoch_jd: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Move ICRS positions from a catalogue epoch to J2000.0.
+
+    Uses ERFA's rigorous space-motion propagation (``pmsafe``),
+    vectorised over the whole catalogue. Missing proper motions
+    count as zero; rows with no usable position come back as NaN.
+
+    Args:
+        ra_deg: Right ascension at ``epoch_jd`` (degrees).
+        dec_deg: Declination at ``epoch_jd`` (degrees).
+        pmra_masyr: Proper motion in RA including the cos(Dec)
+            factor, as catalogues publish it (mas/yr).
+        pmde_masyr: Proper motion in Dec (mas/yr).
+        plx_mas: Parallax (mas); only affects the tiny
+            perspective term, so a NaN is treated as zero.
+        epoch_jd: Julian Date of the catalogue epoch.
+
+    Returns:
+        ``(ra, dec)`` arrays in degrees at epoch J2000.0, with RA
+        normalised to ``[0, 360)``.
+    """
+    ra = np.asarray(ra_deg, dtype=float)
+    dec = np.asarray(dec_deg, dtype=float)
+    ok = np.isfinite(ra) & np.isfinite(dec)
+    out_ra = np.full(ra.shape, np.nan)
+    out_dec = np.full(dec.shape, np.nan)
+    if not ok.any():
+        return out_ra, out_dec
+
+    ra_rad = np.radians(ra[ok])
+    dec_rad = np.radians(dec[ok])
+    pmra = np.nan_to_num(np.asarray(pmra_masyr, dtype=float)[ok])
+    pmde = np.nan_to_num(np.asarray(pmde_masyr, dtype=float)[ok])
+    plx = np.nan_to_num(np.asarray(plx_mas, dtype=float)[ok])
+    plx_arcsec = np.clip(plx, 0.0, None) / 1000.0
+
+    # ERFA wants dRA/dt (not multiplied by cos Dec) in radians/yr.
+    mas_to_rad = np.radians(1.0 / 3.6e6)
+    pmr = pmra * mas_to_rad / np.cos(dec_rad)
+    pmd = pmde * mas_to_rad
+
+    ra2, dec2, _pmr2, _pmd2, _px2, _rv2 = erfa.pmsafe(
+        ra_rad, dec_rad, pmr, pmd, plx_arcsec, np.zeros_like(ra_rad),
+        epoch_jd, 0.0, J2000_JD, 0.0,
+    )
+    out_ra[ok] = np.degrees(ra2) % 360.0
+    out_dec[ok] = np.degrees(dec2)
+    return out_ra, out_dec
+
+
+def gliese_b1950_to_icrs(
+    ra_b1950: list[str],
+    dec_b1950: list[str],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Convert Gliese B1950 sexagesimal positions to ICRS degrees.
+
+    The Gliese catalogue lists FK4 positions for equinox and epoch
+    B1950.0 as ``"hh mm ss"`` and ``"+dd mm.m"`` strings. This
+    only changes the reference frame; the result is still the
+    position at epoch B1950.0 and must be propagated with the
+    catalogue's proper motion afterwards.
+
+    Args:
+        ra_b1950: RA strings; empty strings give NaN.
+        dec_b1950: Dec strings; empty strings give NaN.
+
+    Returns:
+        ``(ra, dec)`` arrays in ICRS degrees at epoch B1950.0.
+    """
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+
+    ra_out = np.full(len(ra_b1950), np.nan)
+    dec_out = np.full(len(dec_b1950), np.nan)
+    idx = [
+        i for i, (r, d) in enumerate(zip(ra_b1950, dec_b1950))
+        if r.strip() and d.strip()
+    ]
+    if not idx:
+        return ra_out, dec_out
+    coords = SkyCoord(
+        [ra_b1950[i] for i in idx],
+        [dec_b1950[i] for i in idx],
+        unit=(u.hourangle, u.deg),
+        frame="fk4", equinox="B1950", obstime="B1950",
+    ).icrs
+    ra_out[idx] = coords.ra.deg
+    dec_out[idx] = coords.dec.deg
+    return ra_out, dec_out
+
+
+def _float_column(table, name: str) -> np.ndarray:
+    """A table column as a float array with masked cells as NaN."""
+    return np.ma.filled(np.ma.asarray(table[name], dtype=float), np.nan)
+
+
+def _text_cell(value) -> str:
+    """A table cell as stripped text, masked cells as ``""``."""
+    if np.ma.is_masked(value):
+        return ""
+    return " ".join(str(value).split())
+
+
+# ICRS J2000.0 positions (SIMBAD) of fast-moving stars that every source
+# must return within REFERENCE_MAX_SEP_ARCSEC of these values, keyed by the
+# catalogue's own identifier. A fetch whose coordinates come back at the
+# wrong epoch, in different units or from a different column puts these
+# stars tens to hundreds of arcseconds away, so the run refuses to build a
+# catalogue from it. The tolerance covers the Gliese catalogue's coarse
+# position precision (one second of time in RA, 0.1 arcmin in Dec).
+REFERENCE_POSITIONS: dict[str, dict[str, tuple[float, float]]] = {
+    "hipparcos": {
+        "87937": (269.45208, 4.69336),   # Barnard's Star
+        "57939": (178.24487, 37.71868),  # Groombridge 1830
+        "24186": (77.91912, -45.01843),  # Kapteyn's Star
+    },
+    "gliese": {
+        "Gl 699": (269.45208, 4.69336),
+        "Gl 451 A": (178.24487, 37.71868),
+        "Gl 191": (77.91912, -45.01843),
+    },
+    "gaia": {
+        "4472832130942575872": (269.45208, 4.69336),
+        "4034171629042489088": (178.24487, 37.71868),
+        "4810594479418041856": (77.91912, -45.01843),
+    },
+}
+REFERENCE_MAX_SEP_ARCSEC = 20.0
+
+
+def check_reference_positions(stars: list[dict], source: str) -> list[str]:
+    """Guard against a fetch whose positions are at the wrong epoch.
+
+    Args:
+        stars: Star dicts from one fetcher; each carries the
+            catalogue's own identifier in ``_catalogue_id``.
+        source: ``REFERENCE_POSITIONS`` key naming the fetcher.
+
+    Returns:
+        A list of error messages; empty when every reference star
+        was returned close to its known J2000.0 position.
+    """
+    by_id = {s.get("_catalogue_id"): s for s in stars}
+    errors = []
+    for cid, (ra, dec) in REFERENCE_POSITIONS[source].items():
+        star = by_id.get(cid)
+        if star is None:
+            errors.append(
+                f"REFERENCE: {source} did not return {cid}; "
+                f"refusing to build a catalogue from a fetch "
+                f"missing a well-known nearby star"
+            )
+            continue
+        sep_arcsec = _angular_sep_deg(
+            star.get("ra_deg"), star.get("dec_deg"), ra, dec,
+        ) * 3600.0
+        if sep_arcsec > REFERENCE_MAX_SEP_ARCSEC:
+            errors.append(
+                f"REFERENCE: {source} places {cid} "
+                f"{sep_arcsec:.0f} arcsec from its J2000 position "
+                f"(limit {REFERENCE_MAX_SEP_ARCSEC:.0f}); the "
+                f"fetch is probably at the wrong epoch"
+            )
+    return errors
+
+
 def _distance_tolerance_ly(distance_ly: float) -> float:
     """Tier 2 distance disagreement allowed for one star."""
     return max(
@@ -130,8 +343,16 @@ def _sources(s: dict) -> set[str]:
 # ---------------------------------------------------------------------------
 # Common names for well-known nearby stars (by HIP ID)
 #
-# IMPORTANT: Every mapping here has been verified against SIMBAD.
-# Do NOT add HIP IDs without confirming the cross-match.
+# Every mapping was re-verified against SIMBAD on 2026-09-06 by comparing
+# the HIPPARCOS position of the ID with SIMBAD's position for the name.
+# Eight of the previous mappings pointed at the wrong star (for example
+# HIP 49908 is Groombridge 1618, not Wolf 359, and HIP 91768/91772 are
+# Struve 2398 A/B, not Kruger 60 A/B). A wrong mapping renames a real star
+# and, when the name also has a KNOWN_STAR_OVERRIDES entry, overwrites that
+# star's data with another star's, so the real star vanishes and the named
+# star is counted twice. Do NOT add HIP IDs without confirming the
+# cross-match; the OVERRIDE_MISMATCH validation check fails the run when
+# an override lands on an entry whose catalogue position is somewhere else.
 # ---------------------------------------------------------------------------
 HIP_COMMON_NAMES = {
     70890: "Proxima Centauri",
@@ -150,12 +371,13 @@ HIP_COMMON_NAMES = {
     104217: "61 Cygni B",
     57548: "Ross 128",
     114046: "Lacaille 9352",
-    439: "Ross 248",
-    92855: "Ross 154",
+    92403: "Ross 154",
+    # Ross 248 and Wolf 359 are too faint for HIPPARCOS; they enter
+    # through the Gliese catalogue (Gl 905 and Gl 406).
     97649: "Altair",
     91262: "Vega",
     113368: "Fomalhaut",
-    49908: "Wolf 359",
+    49908: "Groombridge 1618",
     80824: "Wolf 1061",
     108870: "Epsilon Indi A",
     96100: "Sigma Draconis",
@@ -165,69 +387,99 @@ HIP_COMMON_NAMES = {
     69673: "Arcturus",
     3829: "Van Maanen's Star",
     1475: "Groombridge 34 A",
-    1476: "Groombridge 34 B",
-    91768: "Kruger 60 A",
-    91772: "Kruger 60 B",
+    # Groombridge 34 B has no HIPPARCOS entry — see EXTRA_STARS
+    110893: "Kruger 60 A",
+    91768: "Struve 2398 A",
+    91772: "Struve 2398 B",
     105090: "Lacaille 8760",
-    86990: "Kapteyn's Star",
-    84478: "36 Ophiuchi A",
-    84481: "36 Ophiuchi B",
+    24186: "Kapteyn's Star",
+    84405: "36 Ophiuchi A",
+    84478: "36 Ophiuchi C",
     5643: "YZ Ceti",
-    94761: "GJ 745 A",
+    93873: "GJ 745 A",
+    93899: "GJ 745 B",
     106440: "GJ 832",
 }
 
-# Gliese catalogue name mappings (by Gliese/GJ number)
+# Gliese catalogue name mappings, keyed by the designation ``gliese_name``
+# builds from the catalogue name and component letter (e.g. "Gl 559 A").
+# Verified against SIMBAD on 2026-09-06. Names that also appear in
+# HIP_COMMON_NAMES, KNOWN_STAR_OVERRIDES or EXTRA_STARS make the Gliese
+# row merge with (or be replaced by) that entry instead of surviving as a
+# second copy of the same star under its Gliese designation.
 GLIESE_COMMON_NAMES = {
-    "Gl 551": "Proxima Centauri", "GJ 551": "Proxima Centauri",
-    "Gl 559A": "Alpha Centauri A", "Gl 559B": "Alpha Centauri B",
-    "Gl 699": "Barnard's Star", "GJ 699": "Barnard's Star",
-    "Gl 411": "Lalande 21185", "GJ 411": "Lalande 21185",
-    "Gl 65A": "Luyten 726-8A (BL Ceti)",
-    "Gl 65B": "Luyten 726-8B (UV Ceti)",
-    "Gl 729": "Ross 154", "GJ 729": "Ross 154",
-    "Gl 905": "Ross 248", "GJ 905": "Ross 248",
-    "Gl 144": "Epsilon Eridani", "GJ 144": "Epsilon Eridani",
-    "Gl 887": "Lacaille 9352", "GJ 887": "Lacaille 9352",
-    "Gl 447": "Ross 128", "GJ 447": "Ross 128",
-    "Gl 866A": "EZ Aquarii A", "Gl 866B": "EZ Aquarii B",
-    "Gl 866C": "EZ Aquarii C",
-    "Gl 280A": "Procyon A", "Gl 280B": "Procyon B",
-    "Gl 820A": "61 Cygni A", "Gl 820B": "61 Cygni B",
-    "Gl 725A": "Struve 2398 A", "Gl 725B": "Struve 2398 B",
-    "Gl 15A": "Groombridge 34 A", "Gl 15B": "Groombridge 34 B",
+    "Gl 551": "Proxima Centauri",
+    "Gl 559 A": "Alpha Centauri A", "Gl 559 B": "Alpha Centauri B",
+    "Gl 699": "Barnard's Star",
+    "Gl 406": "Wolf 359",
+    "Gl 411": "Lalande 21185",
+    "Gl 244 A": "Sirius A", "Gl 244 B": "Sirius B",
+    "Gl 65 A": "Luyten 726-8A (BL Ceti)",
+    "Gl 65 B": "Luyten 726-8B (UV Ceti)",
+    "Gl 729": "Ross 154",
+    "Gl 905": "Ross 248",
+    "Gl 144": "Epsilon Eridani",
+    "Gl 887": "Lacaille 9352",
+    "Gl 447": "Ross 128",
+    "Gl 866 AB": "EZ Aquarii A",  # unresolved triple in the catalogue
+    "Gl 280 A": "Procyon A", "Gl 280 B": "Procyon B",
+    "Gl 820 A": "61 Cygni A", "Gl 820 B": "61 Cygni B",
+    "Gl 725 A": "Struve 2398 A", "Gl 725 B": "Struve 2398 B",
+    "Gl 15 A": "Groombridge 34 A", "Gl 15 B": "Groombridge 34 B",
     "Gl 845": "Epsilon Indi A",
-    "Gl 71": "Tau Ceti", "GJ 71": "Tau Ceti",
-    "Gl 273": "Luyten's Star", "GJ 273": "Luyten's Star",
+    "GJ 1111": "DX Cancri",
+    "Gl 71": "Tau Ceti",
+    "Gl 54.1": "YZ Ceti",
+    "Gl 273": "Luyten's Star",
+    "Gl 191": "Kapteyn's Star",
+    "Gl 825": "Lacaille 8760",
+    "Gl 860 A": "Kruger 60 A", "Gl 860 B": "Kruger 60 B",
     "Gl 83.1": "TZ Arietis",
-    "Gl 406": "Wolf 359", "GJ 406": "Wolf 359",
-    "Gl 628": "Wolf 1061", "GJ 628": "Wolf 1061",
-    "Gl 687": "GJ 687", "GJ 687": "GJ 687",
-    "Gl 674": "GJ 674", "GJ 674": "GJ 674",
-    "Gl 876": "GJ 876", "GJ 876": "GJ 876",
-    "Gl 832": "GJ 832", "GJ 832": "GJ 832",
-    "Gl 581": "GJ 581", "GJ 581": "GJ 581",
-    "Gl 667C": "GJ 667 C", "GJ 667C": "GJ 667 C",
-    "Gl 251": "GJ 251", "GJ 251": "GJ 251",
-    "Gl 436": "GJ 436", "GJ 436": "GJ 436",
-    "Gl 1061": "GJ 1061", "GJ 1061": "GJ 1061",
-    "Gl 1002": "GJ 1002", "GJ 1002": "GJ 1002",
-    "Gl 1214": "GJ 1214", "GJ 1214": "GJ 1214",
-    "Gl 3323": "GJ 3323", "GJ 3323": "GJ 3323",
-    "Gl 702": "70 Ophiuchi A", "Gl 702A": "70 Ophiuchi A",
+    "Gl 35": "Van Maanen's Star",
+    "Gl 628": "Wolf 1061",
+    "Gl 380": "Groombridge 1618",
+    "Gl 702 A": "70 Ophiuchi A", "Gl 702 B": "70 Ophiuchi B",
+    "Gl 663 A": "36 Ophiuchi A", "Gl 663 B": "36 Ophiuchi B",
+    "Gl 764": "Sigma Draconis",
+    "Gl 780": "Delta Pavonis",
+    "Gl 139": "82 Eridani",
+    "Gl 768": "Altair",
+    "Gl 721": "Vega",
+    "Gl 881": "Fomalhaut",
+    "Gl 286": "Pollux",
+    "Gl 541": "Arcturus",
+    "Gl 687": "GJ 687",
+    "Gl 674": "GJ 674",
+    "Gl 876": "GJ 876",
+    "Gl 832": "GJ 832",
+    "Gl 581": "GJ 581",
+    "Gl 667 C": "GJ 667 C",
+    "Gl 251": "GJ 251",
+    "Gl 436": "GJ 436",
+    "Gl 745 A": "GJ 745 A", "Gl 745 B": "GJ 745 B",
+    "GJ 1061": "GJ 1061",
+    "GJ 1002": "GJ 1002",
+    "GJ 1214": "GJ 1214",
+    "NN 3323": "GJ 3323",  # CNS3 provisional number; GJ 3323 hosts 2 planets
 }
 
 
 # ---------------------------------------------------------------------------
 # Hand-verified override data for the most important nearby stars.
 # Applied AFTER all catalogue merging to correct any bad data.
-# Source: SIMBAD, NASA Exoplanet Archive (2024 data).
+# Source: SIMBAD, NASA Exoplanet Archive (2024 data). Coordinates are
+# SIMBAD ICRS J2000.0 positions, re-checked on 2026-09-06 (several were
+# wrong by degrees, which also broke the duplicate removal that relies on
+# them). The catalogue entry an override lands on must sit within
+# OVERRIDE_MAX_SEP_ARCSEC of these coordinates, or validation fails.
 # ---------------------------------------------------------------------------
+OVERRIDE_MAX_SEP_ARCSEC = 60.0
+
 KNOWN_STAR_OVERRIDES: dict[str, dict] = {
     "Proxima Centauri": {
         "distance_ly": 4.2465, "spectral_type": "M5.5Ve",
         "apparent_magnitude": 11.13, "known_exoplanets": 3,
-        "ra_deg": 217.4290, "dec_deg": -62.6795,
+        "ra_deg": 217.4289, "dec_deg": -62.6795,
     },
     "Alpha Centauri A": {
         "distance_ly": 4.3650, "spectral_type": "G2V",
@@ -237,7 +489,7 @@ KNOWN_STAR_OVERRIDES: dict[str, dict] = {
     "Alpha Centauri B": {
         "distance_ly": 4.3650, "spectral_type": "K1V",
         "apparent_magnitude": 1.35, "known_exoplanets": 0,
-        "ra_deg": 219.8962, "dec_deg": -60.8372,
+        "ra_deg": 219.8961, "dec_deg": -60.8375,
     },
     "Barnard's Star": {
         "distance_ly": 5.9577, "spectral_type": "M4.0V",
@@ -247,12 +499,12 @@ KNOWN_STAR_OVERRIDES: dict[str, dict] = {
     "Wolf 359": {
         "distance_ly": 7.8558, "spectral_type": "M6.5Ve",
         "apparent_magnitude": 13.54, "known_exoplanets": 0,
-        "ra_deg": 164.1203, "dec_deg": 7.0147,
+        "ra_deg": 164.1205, "dec_deg": 7.0147,
     },
     "Lalande 21185": {
         "distance_ly": 8.3044, "spectral_type": "M2.0V",
         "apparent_magnitude": 7.52, "known_exoplanets": 2,
-        "ra_deg": 165.8342, "dec_deg": 35.9699,
+        "ra_deg": 165.8341, "dec_deg": 35.9699,
     },
     "Sirius A": {
         "distance_ly": 8.6094, "spectral_type": "A1V",
@@ -262,12 +514,12 @@ KNOWN_STAR_OVERRIDES: dict[str, dict] = {
     "Ross 154": {
         "distance_ly": 9.6813, "spectral_type": "M3.5Ve",
         "apparent_magnitude": 10.44, "known_exoplanets": 0,
-        "ra_deg": 282.4592, "dec_deg": -23.8363,
+        "ra_deg": 282.4557, "dec_deg": -23.8362,
     },
     "Ross 248": {
         "distance_ly": 10.2903, "spectral_type": "M5.5V",
         "apparent_magnitude": 12.29, "known_exoplanets": 0,
-        "ra_deg": 355.4828, "dec_deg": 44.1678,
+        "ra_deg": 355.4793, "dec_deg": 44.1774,
     },
     "Epsilon Eridani": {
         "distance_ly": 10.475, "spectral_type": "K2V",
@@ -277,82 +529,82 @@ KNOWN_STAR_OVERRIDES: dict[str, dict] = {
     "Lacaille 9352": {
         "distance_ly": 10.721, "spectral_type": "M0.5V",
         "apparent_magnitude": 7.34, "known_exoplanets": 2,
-        "ra_deg": 346.4665, "dec_deg": -35.8533,
+        "ra_deg": 346.4668, "dec_deg": -35.8531,
     },
     "Ross 128": {
         "distance_ly": 11.007, "spectral_type": "M4.0V",
         "apparent_magnitude": 11.13, "known_exoplanets": 1,
-        "ra_deg": 176.9363, "dec_deg": 0.7993,
+        "ra_deg": 176.9350, "dec_deg": 0.8046,
     },
     "61 Cygni A": {
         "distance_ly": 11.403, "spectral_type": "K5V",
         "apparent_magnitude": 5.21, "known_exoplanets": 0,
-        "ra_deg": 316.7194, "dec_deg": 38.7499,
+        "ra_deg": 316.7247, "dec_deg": 38.7494,
     },
     "61 Cygni B": {
         "distance_ly": 11.403, "spectral_type": "K7V",
         "apparent_magnitude": 6.03, "known_exoplanets": 0,
-        "ra_deg": 316.7346, "dec_deg": 38.7425,
+        "ra_deg": 316.7303, "dec_deg": 38.7420,
     },
     "Procyon A": {
         "distance_ly": 11.402, "spectral_type": "F5IV-V",
         "apparent_magnitude": 0.37, "known_exoplanets": 0,
-        "ra_deg": 114.8256, "dec_deg": 5.2250,
+        "ra_deg": 114.8255, "dec_deg": 5.2250,
     },
     "Groombridge 34 A": {
         "distance_ly": 11.624, "spectral_type": "M1.5V",
         "apparent_magnitude": 8.08, "known_exoplanets": 0,
-        "ra_deg": 4.5956, "dec_deg": 44.0222,
+        "ra_deg": 4.5954, "dec_deg": 44.0230,
     },
     "Tau Ceti": {
         "distance_ly": 11.912, "spectral_type": "G8.5V",
         "apparent_magnitude": 3.50, "known_exoplanets": 4,
-        "ra_deg": 26.0213, "dec_deg": -15.9375,
+        "ra_deg": 26.0170, "dec_deg": -15.9375,
     },
     "Epsilon Indi A": {
         "distance_ly": 11.869, "spectral_type": "K5V",
         "apparent_magnitude": 4.69, "known_exoplanets": 1,
-        "ra_deg": 330.8400, "dec_deg": -56.7860,
+        "ra_deg": 330.8402, "dec_deg": -56.7860,
     },
     "Luyten's Star": {
         "distance_ly": 12.366, "spectral_type": "M3.5V",
         "apparent_magnitude": 9.87, "known_exoplanets": 2,
-        "ra_deg": 109.5365, "dec_deg": 5.2262,
+        "ra_deg": 111.8521, "dec_deg": 5.2258,
     },
     "YZ Ceti": {
         "distance_ly": 12.132, "spectral_type": "M4.5V",
         "apparent_magnitude": 12.07, "known_exoplanets": 3,
-        "ra_deg": 26.8672, "dec_deg": -16.9954,
+        "ra_deg": 18.1277, "dec_deg": -16.9990,
     },
     "Kapteyn's Star": {
         "distance_ly": 12.777, "spectral_type": "sdM1",
         "apparent_magnitude": 8.85, "known_exoplanets": 2,
-        "ra_deg": 77.2972, "dec_deg": -45.0186,
+        "ra_deg": 77.9191, "dec_deg": -45.0184,
     },
     "Kruger 60 A": {
         "distance_ly": 13.149, "spectral_type": "M3V",
         "apparent_magnitude": 9.79, "known_exoplanets": 0,
-        "ra_deg": 331.0918, "dec_deg": 57.6962,
+        "ra_deg": 336.9982, "dec_deg": 57.6950,
     },
     "Kruger 60 B": {
         "distance_ly": 13.149, "spectral_type": "M4V",
         "apparent_magnitude": 11.41, "known_exoplanets": 0,
-        "ra_deg": 331.0918, "dec_deg": 57.6962,
+        "ra_deg": 336.9991, "dec_deg": 57.6972,
     },
     "70 Ophiuchi A": {
         "distance_ly": 16.592, "spectral_type": "K0V",
         "apparent_magnitude": 4.03, "known_exoplanets": 0,
-        "ra_deg": 271.3647, "dec_deg": 2.4993,
+        "ra_deg": 271.3635, "dec_deg": 2.5001,
     },
     "Sigma Draconis": {
         "distance_ly": 18.798, "spectral_type": "G9V",
         "apparent_magnitude": 4.67, "known_exoplanets": 0,
-        "ra_deg": 293.0880, "dec_deg": 69.6611,
+        "ra_deg": 293.0900, "dec_deg": 69.6612,
     },
     "Delta Pavonis": {
         "distance_ly": 19.893, "spectral_type": "G8IV",
         "apparent_magnitude": 3.56, "known_exoplanets": 0,
-        "ra_deg": 302.1830, "dec_deg": -66.1819,
+        "ra_deg": 302.1817, "dec_deg": -66.1821,
     },
     "Altair": {
         "distance_ly": 16.730, "spectral_type": "A7V",
@@ -372,7 +624,7 @@ KNOWN_STAR_OVERRIDES: dict[str, dict] = {
     "Pollux": {
         "distance_ly": 33.720, "spectral_type": "K0IIIb",
         "apparent_magnitude": 1.14, "known_exoplanets": 1,
-        "ra_deg": 116.3289, "dec_deg": 28.0262,
+        "ra_deg": 116.3290, "dec_deg": 28.0262,
     },
     "Arcturus": {
         "distance_ly": 36.660, "spectral_type": "K1.5III",
@@ -385,52 +637,62 @@ KNOWN_STAR_OVERRIDES: dict[str, dict] = {
 # ---------------------------------------------------------------------------
 # Sub-stellar objects and stars too faint or unresolved for catalogue queries.
 # These are hand-verified and ALWAYS override catalogue entries with the same
-# name (see main() logic).
+# name (see main() logic). Coordinates are SIMBAD ICRS J2000.0 positions,
+# re-checked on 2026-09-06: dedup_by_coordinates removes catalogue entries
+# near these positions, so a wrong coordinate here leaves the star listed
+# twice (once curated, once under its Gaia or Gliese designation).
 # ---------------------------------------------------------------------------
 EXTRA_STARS = [
     # Brown dwarfs / sub-stellar
-    {"name": "Luhman 16A", "distance_ly": 6.50, "spectral_type": "L7.5", "apparent_magnitude": 23.25, "known_exoplanets": 0, "ra_deg": 162.3149, "dec_deg": -53.3184},
-    {"name": "Luhman 16B", "distance_ly": 6.50, "spectral_type": "T0.5", "apparent_magnitude": 24.07, "known_exoplanets": 0, "ra_deg": 162.3149, "dec_deg": -53.3184},
-    {"name": "WISE 0855-0714", "distance_ly": 7.43, "spectral_type": "Y4", "apparent_magnitude": 25.0, "known_exoplanets": 0, "ra_deg": 133.7951, "dec_deg": -7.2451},
-    {"name": "WISE 1506+7027", "distance_ly": 11.09, "spectral_type": "T6", "apparent_magnitude": 22.0, "known_exoplanets": 0, "ra_deg": 226.7082, "dec_deg": 70.4600},
-    {"name": "WISE 0350-5658", "distance_ly": 11.47, "spectral_type": "Y1", "apparent_magnitude": 24.0, "known_exoplanets": 0, "ra_deg": 57.5013, "dec_deg": -56.9750},
-    {"name": "UGPS 0722-0540", "distance_ly": 13.43, "spectral_type": "T9", "apparent_magnitude": 23.8, "known_exoplanets": 0, "ra_deg": 110.6146, "dec_deg": -5.6753},
-    {"name": "LP 944-20", "distance_ly": 16.33, "spectral_type": "M9.0V", "apparent_magnitude": 18.50, "known_exoplanets": 0, "ra_deg": 54.8968, "dec_deg": -35.4289},
-    {"name": "WISE 1541-2250", "distance_ly": 18.60, "spectral_type": "Y0.5", "apparent_magnitude": 24.5, "known_exoplanets": 0, "ra_deg": 235.4653, "dec_deg": -22.8403},
+    {"name": "Luhman 16A", "distance_ly": 6.50, "spectral_type": "L7.5", "apparent_magnitude": 23.25, "known_exoplanets": 0, "ra_deg": 162.3084, "dec_deg": -53.3181},
+    {"name": "Luhman 16B", "distance_ly": 6.50, "spectral_type": "T0.5", "apparent_magnitude": 24.07, "known_exoplanets": 0, "ra_deg": 162.3086, "dec_deg": -53.3183},
+    {"name": "WISE 0855-0714", "distance_ly": 7.43, "spectral_type": "Y4", "apparent_magnitude": 25.0, "known_exoplanets": 0, "ra_deg": 133.8189, "dec_deg": -7.2470},
+    {"name": "WISE 1506+7027", "distance_ly": 11.09, "spectral_type": "T6", "apparent_magnitude": 22.0, "known_exoplanets": 0, "ra_deg": 226.7185, "dec_deg": 70.4570},
+    {"name": "WISE 0350-5658", "distance_ly": 11.47, "spectral_type": "Y1", "apparent_magnitude": 24.0, "known_exoplanets": 0, "ra_deg": 57.5025, "dec_deg": -56.9734},
+    {"name": "UGPS 0722-0540", "distance_ly": 13.43, "spectral_type": "T9", "apparent_magnitude": 23.8, "known_exoplanets": 0, "ra_deg": 110.6163, "dec_deg": -5.6760},
+    {"name": "LP 944-20", "distance_ly": 16.33, "spectral_type": "M9.0V", "apparent_magnitude": 18.50, "known_exoplanets": 0, "ra_deg": 54.8969, "dec_deg": -35.4288},
+    {"name": "WISE 1541-2250", "distance_ly": 18.60, "spectral_type": "Y0.5", "apparent_magnitude": 24.5, "known_exoplanets": 0, "ra_deg": 235.4679, "dec_deg": -22.8402},
     {"name": "2MASS J0415-0935", "distance_ly": 18.65, "spectral_type": "T8", "apparent_magnitude": 22.0, "known_exoplanets": 0, "ra_deg": 63.8314, "dec_deg": -9.5852},
     # Stars missing from or unresolved in HIPPARCOS/Gliese/Gaia queries
-    {"name": "Luyten 726-8A (BL Ceti)", "distance_ly": 8.728, "spectral_type": "M5.5Ve", "apparent_magnitude": 12.54, "known_exoplanets": 0, "ra_deg": 24.7560, "dec_deg": -17.9503},
-    {"name": "Luyten 726-8B (UV Ceti)", "distance_ly": 8.728, "spectral_type": "M6.0Ve", "apparent_magnitude": 12.95, "known_exoplanets": 0, "ra_deg": 24.7560, "dec_deg": -17.9503},
-    {"name": "Sirius B", "distance_ly": 8.6094, "spectral_type": "DA2", "apparent_magnitude": 8.44, "known_exoplanets": 0, "ra_deg": 101.2872, "dec_deg": -16.7161},
-    {"name": "EZ Aquarii A", "distance_ly": 11.266, "spectral_type": "M5.0V", "apparent_magnitude": 13.33, "known_exoplanets": 0, "ra_deg": 337.3068, "dec_deg": -15.2845},
-    {"name": "EZ Aquarii B", "distance_ly": 11.266, "spectral_type": "M5.5V", "apparent_magnitude": 13.27, "known_exoplanets": 0, "ra_deg": 337.3068, "dec_deg": -15.2845},
-    {"name": "EZ Aquarii C", "distance_ly": 11.266, "spectral_type": "M6.5V", "apparent_magnitude": 14.03, "known_exoplanets": 0, "ra_deg": 337.3068, "dec_deg": -15.2845},
-    {"name": "Struve 2398 A", "distance_ly": 11.525, "spectral_type": "M3.0V", "apparent_magnitude": 8.94, "known_exoplanets": 0, "ra_deg": 271.1524, "dec_deg": 59.6278},
-    {"name": "Struve 2398 B", "distance_ly": 11.525, "spectral_type": "M3.5V", "apparent_magnitude": 9.70, "known_exoplanets": 0, "ra_deg": 271.1524, "dec_deg": 59.6278},
-    {"name": "Groombridge 34 B", "distance_ly": 11.624, "spectral_type": "M3.5V", "apparent_magnitude": 11.06, "known_exoplanets": 0, "ra_deg": 4.5956, "dec_deg": 44.0222},
-    {"name": "GJ 1061", "distance_ly": 11.991, "spectral_type": "M5.5V", "apparent_magnitude": 13.09, "known_exoplanets": 3, "ra_deg": 53.7423, "dec_deg": -44.6393},
-    {"name": "DX Cancri", "distance_ly": 11.826, "spectral_type": "M6.5Ve", "apparent_magnitude": 14.78, "known_exoplanets": 0, "ra_deg": 124.7430, "dec_deg": 26.7670},
+    {"name": "Luyten 726-8A (BL Ceti)", "distance_ly": 8.728, "spectral_type": "M5.5Ve", "apparent_magnitude": 12.54, "known_exoplanets": 0, "ra_deg": 24.7557, "dec_deg": -17.9507},
+    {"name": "Luyten 726-8B (UV Ceti)", "distance_ly": 8.728, "spectral_type": "M6.0Ve", "apparent_magnitude": 12.95, "known_exoplanets": 0, "ra_deg": 24.7568, "dec_deg": -17.9503},
+    {"name": "Sirius B", "distance_ly": 8.6094, "spectral_type": "DA2", "apparent_magnitude": 8.44, "known_exoplanets": 0, "ra_deg": 101.2888, "dec_deg": -16.7169},
+    {"name": "EZ Aquarii A", "distance_ly": 11.266, "spectral_type": "M5.0V", "apparent_magnitude": 13.33, "known_exoplanets": 0, "ra_deg": 339.6399, "dec_deg": -15.2999},
+    {"name": "EZ Aquarii B", "distance_ly": 11.266, "spectral_type": "M5.5V", "apparent_magnitude": 13.27, "known_exoplanets": 0, "ra_deg": 339.6399, "dec_deg": -15.2999},
+    {"name": "EZ Aquarii C", "distance_ly": 11.266, "spectral_type": "M6.5V", "apparent_magnitude": 14.03, "known_exoplanets": 0, "ra_deg": 339.6399, "dec_deg": -15.2999},
+    {"name": "Struve 2398 A", "distance_ly": 11.525, "spectral_type": "M3.0V", "apparent_magnitude": 8.94, "known_exoplanets": 0, "ra_deg": 280.6946, "dec_deg": 59.6304},
+    {"name": "Struve 2398 B", "distance_ly": 11.525, "spectral_type": "M3.5V", "apparent_magnitude": 9.70, "known_exoplanets": 0, "ra_deg": 280.6954, "dec_deg": 59.6269},
+    {"name": "Groombridge 34 B", "distance_ly": 11.624, "spectral_type": "M3.5V", "apparent_magnitude": 11.06, "known_exoplanets": 0, "ra_deg": 4.6076, "dec_deg": 44.0272},
+    {"name": "GJ 1061", "distance_ly": 11.991, "spectral_type": "M5.5V", "apparent_magnitude": 13.09, "known_exoplanets": 3, "ra_deg": 53.9987, "dec_deg": -44.5127},
+    {"name": "DX Cancri", "distance_ly": 11.826, "spectral_type": "M6.5Ve", "apparent_magnitude": 14.78, "known_exoplanets": 0, "ra_deg": 127.4556, "dec_deg": 26.7760},
     # NOTE: "SO 0253+1652" is Teegarden's Star's discovery
     # designation and must not be listed as a separate entry.
     {"name": "Teegarden's Star", "distance_ly": 12.497, "spectral_type": "M7.0V", "apparent_magnitude": 15.40, "known_exoplanets": 2, "ra_deg": 43.2537, "dec_deg": 16.8813},
-    {"name": "SCR 1845-6357 A", "distance_ly": 12.57, "spectral_type": "M8.5V", "apparent_magnitude": 17.39, "known_exoplanets": 0, "ra_deg": 281.2719, "dec_deg": -63.9631},
-    {"name": "DENIS J1048-3956", "distance_ly": 13.17, "spectral_type": "M8.5V", "apparent_magnitude": 17.39, "known_exoplanets": 0, "ra_deg": 162.0611, "dec_deg": -39.9351},
-    {"name": "SCR J1546-5534", "distance_ly": 14.10, "spectral_type": "M8.5V", "apparent_magnitude": 17.30, "known_exoplanets": 0, "ra_deg": 236.6742, "dec_deg": -55.5736},
-    {"name": "GJ 876", "distance_ly": 15.238, "spectral_type": "M4.0V", "apparent_magnitude": 10.17, "known_exoplanets": 4, "ra_deg": 343.3233, "dec_deg": -14.2526},
-    {"name": "GJ 832", "distance_ly": 16.085, "spectral_type": "M1.5V", "apparent_magnitude": 8.66, "known_exoplanets": 2, "ra_deg": 323.3906, "dec_deg": -49.0094},
-    {"name": "TRAPPIST-1", "distance_ly": 40.66, "spectral_type": "M8V", "apparent_magnitude": 18.80, "known_exoplanets": 7, "ra_deg": 346.6222, "dec_deg": -5.0413},
-    {"name": "LP 890-9", "distance_ly": 104.9, "spectral_type": "M6V", "apparent_magnitude": 18.12, "known_exoplanets": 2, "ra_deg": 279.0667, "dec_deg": -40.1172},
+    {"name": "SCR 1845-6357 A", "distance_ly": 12.57, "spectral_type": "M8.5V", "apparent_magnitude": 17.39, "known_exoplanets": 0, "ra_deg": 281.2719, "dec_deg": -63.9632},
+    {"name": "DENIS J1048-3956", "distance_ly": 13.17, "spectral_type": "M8.5V", "apparent_magnitude": 17.39, "known_exoplanets": 0, "ra_deg": 162.0607, "dec_deg": -39.9352},
+    {"name": "SCR J1546-5534", "distance_ly": 14.10, "spectral_type": "M8.5V", "apparent_magnitude": 17.30, "known_exoplanets": 0, "ra_deg": 236.6737, "dec_deg": -55.5799},
+    {"name": "GJ 876", "distance_ly": 15.238, "spectral_type": "M4.0V", "apparent_magnitude": 10.17, "known_exoplanets": 4, "ra_deg": 343.3197, "dec_deg": -14.2637},
+    {"name": "GJ 832", "distance_ly": 16.085, "spectral_type": "M1.5V", "apparent_magnitude": 8.66, "known_exoplanets": 2, "ra_deg": 323.3916, "dec_deg": -49.0090},
+    {"name": "TRAPPIST-1", "distance_ly": 40.66, "spectral_type": "M8V", "apparent_magnitude": 18.80, "known_exoplanets": 7, "ra_deg": 346.6224, "dec_deg": -5.0414},
+    {"name": "LP 890-9", "distance_ly": 104.9, "spectral_type": "M6V", "apparent_magnitude": 18.12, "known_exoplanets": 2, "ra_deg": 64.1298, "dec_deg": -28.3147},
 ]
 
 
 # ---------------------------------------------------------------------------
 # Catalogue fetchers
+#
+# Each fetcher asks VizieR for the catalogue's native position, proper
+# motion and parallax columns and derives J2000.0 positions itself (see the
+# coordinate-epoch section above). Every returned star carries the
+# catalogue's own identifier in ``_catalogue_id`` for the reference check.
 # ---------------------------------------------------------------------------
 def fetch_hipparcos(max_dist_ly: float) -> list[dict]:
     """Query HIPPARCOS via Vizier for stars within *max_dist_ly*.
 
     Filters by parallax signal-to-noise ratio to reject entries
-    with unreliable distance measurements.
+    with unreliable distance measurements. Positions are the
+    catalogue's ICRS values at epoch J1991.25 propagated to
+    J2000.0 with the catalogue proper motions.
 
     Args:
         max_dist_ly: Maximum distance in light-years.
@@ -439,7 +701,7 @@ def fetch_hipparcos(max_dist_ly: float) -> list[dict]:
         A list of star dicts with keys ``name``, ``distance_ly``,
         ``spectral_type``, ``apparent_magnitude``,
         ``known_exoplanets``, ``ra_deg``, ``dec_deg``,
-        ``_source``, and ``_hip_id``.
+        ``_source``, ``_catalogue_id`` and ``_hip_id``.
     """
     from astroquery.vizier import Vizier
 
@@ -447,7 +709,10 @@ def fetch_hipparcos(max_dist_ly: float) -> list[dict]:
     min_parallax = 1000.0 / max_dist_pc
 
     print(f"[1/4] Querying HIPPARCOS (parallax > {min_parallax:.1f} mas)...")
-    v = Vizier(columns=["HIP", "Plx", "e_Plx", "Vmag", "SpType", "_RAJ2000", "_DEJ2000"], row_limit=-1)
+    v = Vizier(
+        columns=["HIP", "RAICRS", "DEICRS", "pmRA", "pmDE", "Plx", "e_Plx", "Vmag", "SpType"],
+        row_limit=-1,
+    )
     try:
         result = v.query_constraints(catalog="I/239/hip_main", Plx=f">{min_parallax:.1f}")
     except Exception as e:
@@ -459,9 +724,18 @@ def fetch_hipparcos(max_dist_ly: float) -> list[dict]:
         return []
 
     table = result[0]
+    ra_j2000, dec_j2000 = propagate_to_j2000(
+        _float_column(table, "RAICRS"), _float_column(table, "DEICRS"),
+        _float_column(table, "pmRA"), _float_column(table, "pmDE"),
+        _float_column(table, "Plx"), HIPPARCOS_EPOCH_JD,
+    )
+
     stars = []
-    for row in table:
-        plx = float(row["Plx"])
+    for i, row in enumerate(table):
+        try:
+            plx = float(row["Plx"])
+        except (ValueError, TypeError):
+            continue
         if plx <= 0:
             continue
         try:
@@ -471,16 +745,13 @@ def fetch_hipparcos(max_dist_ly: float) -> list[dict]:
         if e_plx > 0 and plx / e_plx < MIN_PARALLAX_SNR:
             continue
         dist_ly = (1000.0 / plx) * 3.26156
-        vmag = float(row["Vmag"]) if row["Vmag"] else 99.0
-        sp = str(row["SpType"]).strip() if row["SpType"] else ""
+        vmag = float(row["Vmag"]) if not np.ma.is_masked(row["Vmag"]) else 99.0
+        sp = _text_cell(row["SpType"])
         hip_id = int(row["HIP"])
         name = HIP_COMMON_NAMES.get(hip_id, f"HIP {hip_id}")
 
-        try:
-            ra = float(row["_RAJ2000"])
-            dec = float(row["_DEJ2000"])
-        except (KeyError, ValueError, TypeError):
-            ra, dec = None, None
+        ra, dec = ra_j2000[i], dec_j2000[i]
+        has_pos = bool(np.isfinite(ra) and np.isfinite(dec))
 
         stars.append({
             "name": name,
@@ -489,9 +760,11 @@ def fetch_hipparcos(max_dist_ly: float) -> list[dict]:
             "apparent_magnitude": round(vmag, 2),
             "magnitude_band": "V",
             "known_exoplanets": 0,
-            "ra_deg": round(ra, 4) if ra is not None else None,
-            "dec_deg": round(dec, 4) if dec is not None else None,
+            "ra_deg": round(float(ra), 4) if has_pos else None,
+            "dec_deg": round(float(dec), 4) if has_pos else None,
             "_source": "hipparcos",
+            "_pos_source": "hipparcos",
+            "_catalogue_id": str(hip_id),
             "_hip_id": hip_id,
         })
 
@@ -499,8 +772,31 @@ def fetch_hipparcos(max_dist_ly: float) -> list[dict]:
     return stars
 
 
+def gliese_name(name: str, comp: str) -> str:
+    """Build the designation for one Gliese catalogue row.
+
+    The catalogue lists resolved multiple systems as one row per
+    component, with the component letter in a separate column.
+    ``(Name, Comp)`` is unique across the table while ``Name``
+    alone is not (Gl 451 A and B, Gl 4 A and B, ...), so the
+    component is part of the designation, e.g. ``"Gl 559 A"``.
+
+    Args:
+        name: Raw ``Name`` cell, e.g. ``"Gl 559"``.
+        comp: Raw ``Comp`` cell, e.g. ``"A"`` or ``""``.
+
+    Returns:
+        The designation with single spaces.
+    """
+    return " ".join(f"{name} {comp}".split())
+
+
 def fetch_gliese(max_dist_ly: float) -> list[dict]:
     """Query the Gliese Catalogue of Nearby Stars (3rd ed.) via Vizier.
+
+    Positions are the catalogue's B1950 values converted to ICRS
+    and propagated from epoch B1950.0 to J2000.0 with the
+    catalogue's total proper motion and position angle.
 
     Args:
         max_dist_ly: Maximum distance in light-years.
@@ -515,7 +811,10 @@ def fetch_gliese(max_dist_ly: float) -> list[dict]:
     min_parallax = 1000.0 / max_dist_pc
 
     print("[2/4] Querying Gliese Catalogue of Nearby Stars...")
-    v = Vizier(columns=["Name", "plx", "e_plx", "Vmag", "Sp", "_RAJ2000", "_DEJ2000"], row_limit=-1)
+    v = Vizier(
+        columns=["Name", "Comp", "RAB1950", "DEB1950", "pm", "pmPA", "plx", "e_plx", "Vmag", "Sp"],
+        row_limit=-1,
+    )
     try:
         result = v.query_constraints(catalog="V/70A/catalog", plx=f">{min_parallax:.1f}")
     except Exception as e:
@@ -527,8 +826,21 @@ def fetch_gliese(max_dist_ly: float) -> list[dict]:
         return []
 
     table = result[0]
+    ra_1950, dec_1950 = gliese_b1950_to_icrs(
+        [_text_cell(x) for x in table["RAB1950"]],
+        [_text_cell(x) for x in table["DEB1950"]],
+    )
+    pm_arcsec = np.nan_to_num(_float_column(table, "pm"))
+    pa_rad = np.radians(np.nan_to_num(_float_column(table, "pmPA")))
+    ra_j2000, dec_j2000 = propagate_to_j2000(
+        ra_1950, dec_1950,
+        pm_arcsec * 1000.0 * np.sin(pa_rad),
+        pm_arcsec * 1000.0 * np.cos(pa_rad),
+        _float_column(table, "plx"), B1950_JD,
+    )
+
     stars = []
-    for row in table:
+    for i, row in enumerate(table):
         try:
             plx = float(row["plx"])
         except (ValueError, TypeError):
@@ -542,18 +854,15 @@ def fetch_gliese(max_dist_ly: float) -> list[dict]:
         if e_plx > 0 and plx / e_plx < MIN_PARALLAX_SNR:
             continue
         dist_ly = (1000.0 / plx) * 3.26156
-        vmag = float(row["Vmag"]) if row["Vmag"] else 99.0
-        sp = str(row["Sp"]).strip() if row["Sp"] else ""
-        raw_name = str(row["Name"]).strip()
+        vmag = float(row["Vmag"]) if not np.ma.is_masked(row["Vmag"]) else 99.0
+        sp = _text_cell(row["Sp"])
+        raw_name = gliese_name(_text_cell(row["Name"]), _text_cell(row["Comp"]))
 
         # Apply common name if known
         name = GLIESE_COMMON_NAMES.get(raw_name, raw_name)
 
-        try:
-            ra = float(row["_RAJ2000"])
-            dec = float(row["_DEJ2000"])
-        except (KeyError, ValueError, TypeError):
-            ra, dec = None, None
+        ra, dec = ra_j2000[i], dec_j2000[i]
+        has_pos = bool(np.isfinite(ra) and np.isfinite(dec))
 
         stars.append({
             "name": name,
@@ -562,9 +871,11 @@ def fetch_gliese(max_dist_ly: float) -> list[dict]:
             "apparent_magnitude": round(vmag, 2),
             "magnitude_band": "V",
             "known_exoplanets": 0,
-            "ra_deg": round(ra, 4) if ra is not None else None,
-            "dec_deg": round(dec, 4) if dec is not None else None,
+            "ra_deg": round(float(ra), 4) if has_pos else None,
+            "dec_deg": round(float(dec), 4) if has_pos else None,
             "_source": "gliese",
+            "_pos_source": "gliese",
+            "_catalogue_id": raw_name,
         })
 
     print(f"  Found {len(stars)} stars")
@@ -648,17 +959,19 @@ def estimate_spectral_class(
 def fetch_gaia_nearby(max_dist_ly: float) -> list[dict]:
     """Query Gaia DR3 via Vizier for nearby stars.
 
-    Falls back to the Gaia EDR3 distances catalogue if the
-    primary DR3 catalogue returns no results.  G magnitudes are
-    converted to approximate V using BP-RP where possible and
-    labelled with their band otherwise.
+    Positions are the catalogue's ICRS values at epoch J2016.0
+    propagated to J2000.0 with the Gaia proper motions. G
+    magnitudes are converted to approximate V using BP-RP where
+    possible and labelled with their band otherwise. There is no
+    fallback catalogue: the fetch-count guard in ``main`` fails
+    the run if this query returns nothing.
 
     Args:
         max_dist_ly: Maximum distance in light-years.
 
     Returns:
-        A list of star dicts.  Spectral types are empty since
-        Gaia does not provide MK classification.
+        A list of star dicts.  Spectral types are estimates from
+        colour since Gaia does not provide MK classification.
     """
     from astroquery.vizier import Vizier
 
@@ -667,7 +980,7 @@ def fetch_gaia_nearby(max_dist_ly: float) -> list[dict]:
 
     print(f"[3/4] Querying Gaia DR3 (parallax > {min_parallax:.1f} mas)...")
     v = Vizier(
-        columns=["Source", "Plx", "e_Plx", "Gmag", "BP-RP", "_RAJ2000", "_DEJ2000"],
+        columns=["Source", "RA_ICRS", "DE_ICRS", "pmRA", "pmDE", "Plx", "e_Plx", "Gmag", "BP-RP"],
         row_limit=-1,
     )
 
@@ -681,55 +994,39 @@ def fetch_gaia_nearby(max_dist_ly: float) -> list[dict]:
         return []
 
     if not result or len(result) == 0:
-        print("  WARNING: No Gaia results (may need different catalogue ID)")
-        try:
-            print("  Trying Gaia EDR3 distances catalogue...")
-            result = v.query_constraints(
-                catalog="I/352/gedr3dis",
-                Plx=f">{min_parallax:.1f}",
-            )
-        except Exception as e:
-            print(f"  WARNING: Gaia EDR3 query also failed: {e}")
-            return []
-
-    if not result or len(result) == 0:
-        print("  No Gaia results found")
+        print("  WARNING: No Gaia results")
         return []
 
     table = result[0]
+    ra_j2000, dec_j2000 = propagate_to_j2000(
+        _float_column(table, "RA_ICRS"), _float_column(table, "DE_ICRS"),
+        _float_column(table, "pmRA"), _float_column(table, "pmDE"),
+        _float_column(table, "Plx"), GAIA_DR3_EPOCH_JD,
+    )
+    bp_rp_col = _float_column(table, "BP-RP")
+
     stars = []
-    for row in table:
+    for i, row in enumerate(table):
         try:
             plx = float(row["Plx"])
-        except (ValueError, TypeError, KeyError):
+        except (ValueError, TypeError):
             continue
         if plx <= 0:
             continue
         try:
             e_plx = float(row["e_Plx"])
-        except (ValueError, TypeError, KeyError):
+        except (ValueError, TypeError):
             continue  # skip stars with unparseable parallax errors
         if e_plx > 0 and plx / e_plx < MIN_PARALLAX_SNR:
             continue
         dist_ly = (1000.0 / plx) * 3.26156
-        try:
-            gmag = float(row["Gmag"]) if "Gmag" in row.colnames and row["Gmag"] else 99.0
-        except (ValueError, TypeError):
-            gmag = 99.0
-        try:
-            bp_rp = float(row["BP-RP"]) if "BP-RP" in row.colnames else None
-            if bp_rp is not None and math.isnan(bp_rp):
-                bp_rp = None
-        except (ValueError, TypeError):
-            bp_rp = None
+        gmag = float(row["Gmag"]) if not np.ma.is_masked(row["Gmag"]) else 99.0
+        bp_rp = float(bp_rp_col[i]) if np.isfinite(bp_rp_col[i]) else None
         sp = estimate_spectral_class(bp_rp, gmag, dist_ly)
-        source_id = str(row["Source"]) if "Source" in row.colnames else "unknown"
+        source_id = str(row["Source"])
 
-        try:
-            ra = float(row["_RAJ2000"])
-            dec = float(row["_DEJ2000"])
-        except (KeyError, ValueError, TypeError):
-            ra, dec = None, None
+        ra, dec = ra_j2000[i], dec_j2000[i]
+        has_pos = bool(np.isfinite(ra) and np.isfinite(dec))
 
         v_est = gaia_g_to_v(gmag, bp_rp) if gmag != 99.0 else None
         if v_est is not None:
@@ -744,9 +1041,11 @@ def fetch_gaia_nearby(max_dist_ly: float) -> list[dict]:
             "apparent_magnitude": mag,
             "magnitude_band": band,
             "known_exoplanets": 0,
-            "ra_deg": round(ra, 4) if ra is not None else None,
-            "dec_deg": round(dec, 4) if dec is not None else None,
+            "ra_deg": round(float(ra), 4) if has_pos else None,
+            "dec_deg": round(float(dec), 4) if has_pos else None,
             "_source": "gaia",
+            "_pos_source": "gaia",
+            "_catalogue_id": source_id,
         })
 
     print(f"  Found {len(stars)} stars")
@@ -929,6 +1228,19 @@ def _is_catalogue_id(name: str) -> bool:
     )
 
 
+def _has_precise_position(s: dict) -> bool:
+    """Whether an entry's position is modern astrometry at J2000.
+
+    Args:
+        s: Star dict, before or after merging.
+
+    Returns:
+        ``True`` for positions from HIPPARCOS or Gaia; ``False``
+        for Gliese positions and hand-curated entries.
+    """
+    return s.get("_pos_source") in ("hipparcos", "gaia")
+
+
 def _same_star(a: dict, b: dict) -> bool:
     """Heuristic: are two catalogue entries the same physical star?
 
@@ -941,10 +1253,12 @@ def _same_star(a: dict, b: dict) -> bool:
     - Two entries with the same common name match when close on
       the sky; two DIFFERENT common names never match.
     - Otherwise (at least one catalogue ID): positions within
-      ``COINCIDENT_SEP_ARCSEC`` match unconditionally (tier 1),
-      and positions within ``MERGE_MAX_SEP_DEG`` match when the
-      distances also agree within the scaled tolerance (tier 2,
-      the proper-motion drift window).
+      ``COINCIDENT_SEP_ARCSEC`` match unconditionally (tier 1;
+      ``GLIESE_COINCIDENT_SEP_ARCSEC`` when either position is a
+      coarse Gliese or curated one), and positions within
+      ``MERGE_MAX_SEP_DEG`` match when the distances also agree
+      within the scaled tolerance (tier 2). Tier 2 is skipped
+      when both positions come from HIPPARCOS or Gaia.
 
     Args:
         a: First star dict.
@@ -973,8 +1287,16 @@ def _same_star(a: dict, b: dict) -> bool:
             return sep < 5.0
         return False
 
-    if sep < COINCIDENT_SEP_ARCSEC / 3600.0:
+    both_precise = _has_precise_position(a) and _has_precise_position(b)
+    coincident = (
+        COINCIDENT_SEP_ARCSEC if both_precise
+        else GLIESE_COINCIDENT_SEP_ARCSEC
+    )
+    if sep < coincident / 3600.0:
         return True
+
+    if both_precise:
+        return False
 
     dist_diff = abs(a["distance_ly"] - b["distance_ly"])
     tol = _distance_tolerance_ly(
@@ -987,9 +1309,11 @@ def _absorb(existing: dict, star: dict) -> None:
     """Fold a duplicate entry into its canonical merged entry.
 
     Keeps the richer name, non-empty spectral type, V-band
-    magnitude, higher exoplanet count, HIP ID, and coordinates,
-    and adopts the distance from the most reliable contributing
-    catalogue (Gaia over HIPPARCOS over Gliese).
+    magnitude, higher exoplanet count and HIP ID, and adopts the
+    distance and the position from the most reliable contributing
+    catalogue (Gaia over HIPPARCOS over Gliese): the best parallax
+    comes with the best astrometry, and a merged entry must not
+    keep a Gliese position quantised to a second of time.
 
     Args:
         existing: The merged entry to keep (mutated in place).
@@ -1009,6 +1333,7 @@ def _absorb(existing: dict, star: dict) -> None:
             and star.get("ra_deg") is not None):
         existing["ra_deg"] = star["ra_deg"]
         existing["dec_deg"] = star["dec_deg"]
+        existing["_pos_source"] = star.get("_pos_source")
     if (existing.get("magnitude_band") == "G"
             and star.get("magnitude_band") == "V"):
         existing["apparent_magnitude"] = star["apparent_magnitude"]
@@ -1026,6 +1351,10 @@ def _absorb(existing: dict, star: dict) -> None:
         existing["_dist_source"] = (
             star.get("_dist_source") or star.get("_source")
         )
+        if star.get("ra_deg") is not None:
+            existing["ra_deg"] = star["ra_deg"]
+            existing["dec_deg"] = star["dec_deg"]
+            existing["_pos_source"] = star.get("_pos_source")
 
     existing["_merged_sources"] = _sources(existing) | _sources(star)
 
@@ -1091,10 +1420,10 @@ def dedup_by_coordinates(
 
     After EXTRA_STARS are injected, Gaia/Gliese entries for the
     same physical star may remain under catalogue designations.
-    This removes them using the same distance-scaled tolerance
-    and proper-motion-aware separation as ``_same_star``, so
-    fast movers like Teegarden's Star are caught even though
-    their catalogue positions drift arcminutes between epochs.
+    This removes them with the same rules as ``_same_star``; the
+    curated entries carry no position provenance, so the wide
+    distance-checked window still applies to them and a curated
+    coordinate a few arcseconds off still catches its duplicate.
     """
     to_remove: list[int] = []
     auth_names = {s["name"] for s in authoritative}
@@ -1219,6 +1548,11 @@ def apply_overrides(stars: list[dict]) -> int:
     for s in stars:
         if s["name"] in KNOWN_STAR_OVERRIDES:
             override = KNOWN_STAR_OVERRIDES[s["name"]]
+            # Remember where the catalogues put this entry so the
+            # validator can tell whether the override landed on
+            # the star it names.
+            s["_catalogue_ra"] = s.get("ra_deg")
+            s["_catalogue_dec"] = s.get("dec_deg")
             for key, val in override.items():
                 s[key] = val
             # Override magnitudes are SIMBAD V magnitudes.
@@ -1328,19 +1662,30 @@ def validate_catalogue(stars: list[dict]) -> list[str]:
         if name not in seen_names:
             errors.append(f"MISSING: '{name}' not in catalogue")
 
-    # Overrides actually applied (coordinates match)
+    # Overrides must land on the star they name. The position the
+    # catalogues gave the entry (kept by apply_overrides) has to
+    # agree with the override's SIMBAD position; a large gap means
+    # a HIP or Gliese name mapping points at a different star,
+    # which the override would then silently overwrite.
     for s in stars:
-        if s["name"] in KNOWN_STAR_OVERRIDES:
-            ov = KNOWN_STAR_OVERRIDES[s["name"]]
-            sep = _angular_sep_deg(
-                s.get("ra_deg"), s.get("dec_deg"),
-                ov["ra_deg"], ov["dec_deg"],
+        if s["name"] not in KNOWN_STAR_OVERRIDES:
+            continue
+        cat_ra = s.get("_catalogue_ra")
+        cat_dec = s.get("_catalogue_dec")
+        if cat_ra is None or cat_dec is None:
+            continue
+        ov = KNOWN_STAR_OVERRIDES[s["name"]]
+        sep_arcsec = _angular_sep_deg(
+            cat_ra, cat_dec, ov["ra_deg"], ov["dec_deg"],
+        ) * 3600.0
+        if sep_arcsec > OVERRIDE_MAX_SEP_ARCSEC:
+            errors.append(
+                f"OVERRIDE_MISMATCH: '{s['name']}' override "
+                f"landed on a catalogue entry {sep_arcsec:.0f} "
+                f"arcsec away (limit "
+                f"{OVERRIDE_MAX_SEP_ARCSEC:.0f}); a name "
+                f"mapping points at the wrong star"
             )
-            if sep > 1.0:
-                errors.append(
-                    f"OVERRIDE_FAILED: '{s['name']}' is "
-                    f"{sep:.1f} deg from expected position"
-                )
 
     # Value range checks
     for i, s in enumerate(stars):
@@ -1470,14 +1815,19 @@ def main() -> None:
     gliese_stars = fetch_gliese(MAX_RADIUS_LY)
     gaia_stars = fetch_gaia_nearby(MAX_RADIUS_LY)
 
-    # Refuse to continue if any source came back empty or thin:
-    # a catalogue built from the remainder would look plausible
-    # while silently missing thousands of stars.
+    # Refuse to continue if any source came back empty or thin
+    # (a catalogue built from the remainder would look plausible
+    # while silently missing thousands of stars) ...
     fetch_errors = check_fetch_counts({
         "hipparcos": len(hip_stars),
         "gliese": len(gliese_stars),
         "gaia": len(gaia_stars),
     })
+    # ... or with positions at the wrong epoch: fast-moving reference
+    # stars must come back where they belong at J2000.0.
+    fetch_errors += check_reference_positions(hip_stars, "hipparcos")
+    fetch_errors += check_reference_positions(gliese_stars, "gliese")
+    fetch_errors += check_reference_positions(gaia_stars, "gaia")
     if fetch_errors:
         print(f"\nERROR: {len(fetch_errors)} fetch failure(s):")
         for e in fetch_errors:

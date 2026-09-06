@@ -13,6 +13,12 @@ on:
     - cron: "17 4 3 * *"
   workflow_dispatch: {}
 
+# These permissions are necessary but not sufficient for the final
+# step: GitHub also requires the repository setting "Allow GitHub
+# Actions to create and approve pull requests" (Settings > Actions >
+# General > Workflow permissions). Without it the run pushes the
+# branch and then fails with "GitHub Actions is not permitted to
+# create or approve pull requests".
 permissions:
   contents: write
   pull-requests: write
@@ -22,10 +28,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.13"
 
@@ -46,7 +52,7 @@ jobs:
       # Creates a PR only when the working tree differs, so
       # no-change runs end quietly here.
       - name: Open pull request if data changed
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           add-paths: data/
           branch: data/refresh

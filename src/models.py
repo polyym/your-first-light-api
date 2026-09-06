@@ -578,11 +578,33 @@ class FirstLightResponse(BaseModel):
     as_of: str
 
     # time_alive
-    age_years: float | None = None
-    age_days: int | None = None
-    age_hours: int | None = None
-    age_minutes: int | None = None
-    age_seconds: int | None = None
+    age_years: float | None = Field(
+        None,
+        description="Elapsed time in Julian years (365.25 days).",
+    )
+    age_days: int | None = Field(
+        None,
+        description="Whole calendar days between the two dates.",
+    )
+    age_hours: int | None = Field(
+        None,
+        description="Whole hours elapsed (derived from age_seconds).",
+    )
+    age_minutes: int | None = Field(
+        None,
+        description=(
+            "Whole minutes elapsed (derived from age_seconds)."
+        ),
+    )
+    age_seconds: int | None = Field(
+        None,
+        description=(
+            "Elapsed SI seconds between midnight UTC on the two "
+            "dates. This is physical time, so it includes every "
+            "leap second inserted during the interval and can "
+            "exceed age_days x 86400 by a few seconds."
+        ),
+    )
     earth_rotations: float | None = Field(
         None,
         description=(

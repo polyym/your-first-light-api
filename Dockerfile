@@ -35,4 +35,7 @@ EXPOSE 8000
 # Shell form so ${PORT} from the platform (e.g. Render) is
 # honoured, defaulting to 8000 locally; exec replaces the shell
 # so uvicorn is PID 1 and receives SIGTERM for graceful stops.
-CMD exec uvicorn src.app:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1
+# The app's own request log already records every request with
+# the resolved client IP and duration, so uvicorn's access log
+# is disabled rather than logging each request twice.
+CMD exec uvicorn src.app:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1 --no-access-log

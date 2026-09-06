@@ -5,6 +5,9 @@ synthetic data; no network access is required.
 """
 
 import json
+import math
+
+import numpy as np
 
 import tools.update_data as update_data
 import tools.updaters.update_eclipses as update_eclipses
@@ -80,19 +83,59 @@ class TestSameStar:
         )
         assert not _same_star(a, b)
 
-    def test_proper_motion_drift_still_merges(self):
-        """Barnard's Star drifts ~0.07 deg between the
-        HIPPARCOS and Gaia epochs; the separation window must
-        absorb that."""
+    def test_coarse_gliese_position_still_merges_in_window(self):
+        """A Gliese position can be tens of arcseconds off even
+        after propagation to J2000; the distance-checked window
+        must absorb that."""
         a = _star(
-            "Barnard's Star", 5.9577, 269.4521, 4.6934,
-            source="hipparcos", hip=87937,
+            "Gaia DR3 1", 25.0, 100.0, 20.0, source="gaia",
         )
-        b = _star(
-            "Gaia DR3 4472832130942575872", 5.978,
-            269.4486, 4.7398, source="gaia", band="G",
-        )
+        a["_pos_source"] = "gaia"
+        b = _star("Gl 999", 24.0, 100.0, 20.01, source="gliese")
+        b["_pos_source"] = "gliese"
         assert _same_star(a, b)
+
+    def test_gliese_position_within_30_arcsec_merges(self):
+        """Gl 734 A sits 19 arcsec from its Gaia entry with a 15%
+        photometric-distance disagreement: same star."""
+        a = _star("Gl 734 A", 52.5211, 280.0, 10.0, source="gliese")
+        a["_pos_source"] = "gliese"
+        b = _star(
+            "Gaia DR3 4311983376654646656", 61.0515,
+            280.0, 10.0053, source="gaia", band="G",
+        )
+        b["_pos_source"] = "gaia"
+        assert _same_star(a, b)
+
+    def test_precise_positions_20_arcsec_apart_do_not_merge(self):
+        a = _star(
+            "HIP 1", 60.0, 280.0, 10.0, source="hipparcos", hip=1,
+        )
+        a["_pos_source"] = "hipparcos"
+        b = _star(
+            "Gaia DR3 2", 60.0, 280.0, 10.0056, source="gaia",
+        )
+        b["_pos_source"] = "gaia"
+        assert not _same_star(a, b)
+
+    def test_two_precise_positions_apart_are_two_stars(self):
+        """Every source is at epoch J2000, so HIPPARCOS and Gaia
+        agree to well under an arcsecond for the same star. A
+        Gaia entry 400 arcsec from a HIPPARCOS star at the same
+        distance is a wide companion (Epsilon Indi A and its
+        brown-dwarf pair), not the star itself."""
+        a = _star(
+            "Epsilon Indi A", 11.869, 330.8402, -56.7860,
+            source="hipparcos", hip=108870,
+        )
+        a["_pos_source"] = "hipparcos"
+        b = _star(
+            "Gaia DR3 6412596012186366336", 12.05,
+            331.0441, -56.7828, source="gaia", band="G",
+        )
+        b["_pos_source"] = "gaia"
+        assert not _same_star(a, b)
+        assert len(merge_catalogues([a], [b])) == 2
 
     def test_different_hip_ids_never_merge(self):
         a = _star(
@@ -106,8 +149,8 @@ class TestSameStar:
         assert not _same_star(a, b)
 
     def test_distinct_common_names_never_merge(self):
-        a = _star("Kruger 60 A", 13.149, 331.0918, 57.6962)
-        b = _star("Kruger 60 B", 13.149, 331.0918, 57.6962)
+        a = _star("Kruger 60 A", 13.149, 336.9982, 57.6950)
+        b = _star("Kruger 60 B", 13.149, 336.9991, 57.6972)
         assert not _same_star(a, b)
 
     def test_same_common_name_merges(self):
@@ -612,4 +655,243 @@ class TestManifest:
         assert (
             after["files"]["stars.json"]["updated"]
             == "2001-01-01"
+        )
+
+
+def _sep_arcsec(ra1, dec1, ra2, dec2):
+    return update_stars._angular_sep_deg(ra1, dec1, ra2, dec2) * 3600.0
+
+
+class TestEpochPropagation:
+    """Every source is moved to epoch J2000.0 from its own epoch.
+
+    In 2026 VizieR stopped applying proper motion to its computed
+    J2000 columns for the Gliese catalogue, which shifted every
+    fast mover by fifty years of motion and duplicated ~300 stars
+    in one refresh. Positions are now derived in-house.
+    """
+
+    def test_gaia_epoch_2016_reaches_simbad_j2000(self):
+        # Barnard's Star, Gaia DR3 4472832130942575872.
+        ra, dec = update_stars.propagate_to_j2000(
+            np.array([269.44850253]), np.array([4.73942005]),
+            np.array([-801.551]), np.array([10362.394]),
+            np.array([546.9759]), update_stars.GAIA_DR3_EPOCH_JD,
+        )
+        assert _sep_arcsec(ra[0], dec[0], 269.45208, 4.69336) < 0.5
+
+    def test_hipparcos_epoch_reaches_simbad_j2000(self):
+        # Groombridge 1830, HIP 57939.
+        ra, dec = update_stars.propagate_to_j2000(
+            np.array([178.23256802]), np.array([37.73280827]),
+            np.array([4003.69]), np.array([-5813.00]),
+            np.array([109.21]), update_stars.HIPPARCOS_EPOCH_JD,
+        )
+        assert _sep_arcsec(ra[0], dec[0], 178.24487, 37.71868) < 0.5
+
+    def test_gliese_b1950_row_reaches_j2000(self):
+        """Groombridge 1830 as the Gliese catalogue lists it:
+        B1950 position, total proper motion and position angle.
+        Without the fifty years of motion the star sits ~350
+        arcsec away, which is exactly the 2026 regression."""
+        ra0, dec0 = update_stars.gliese_b1950_to_icrs(
+            ["11 50 06"], ["+38 04.7"],
+        )
+        assert _sep_arcsec(ra0[0], dec0[0], 178.24487, 37.71868) > 300
+        pm, pa = 7.053, math.radians(145.4)
+        ra, dec = update_stars.propagate_to_j2000(
+            ra0, dec0,
+            np.array([pm * 1000 * math.sin(pa)]),
+            np.array([pm * 1000 * math.cos(pa)]),
+            np.array([116.0]), update_stars.B1950_JD,
+        )
+        assert _sep_arcsec(ra[0], dec[0], 178.24487, 37.71868) < 10
+
+    def test_zero_proper_motion_is_identity(self):
+        ra, dec = update_stars.propagate_to_j2000(
+            np.array([10.0]), np.array([-20.0]),
+            np.array([0.0]), np.array([0.0]),
+            np.array([50.0]), update_stars.HIPPARCOS_EPOCH_JD,
+        )
+        assert abs(ra[0] - 10.0) < 1e-6
+        assert abs(dec[0] + 20.0) < 1e-6
+
+    def test_missing_proper_motion_counts_as_zero(self):
+        ra, dec = update_stars.propagate_to_j2000(
+            np.array([10.0]), np.array([-20.0]),
+            np.array([np.nan]), np.array([np.nan]),
+            np.array([np.nan]), update_stars.GAIA_DR3_EPOCH_JD,
+        )
+        assert abs(ra[0] - 10.0) < 1e-6
+        assert abs(dec[0] + 20.0) < 1e-6
+
+    def test_missing_position_stays_missing(self):
+        ra, dec = update_stars.propagate_to_j2000(
+            np.array([np.nan, 1.0]), np.array([np.nan, 2.0]),
+            np.array([0.0, 0.0]), np.array([0.0, 0.0]),
+            np.array([50.0, 50.0]), update_stars.HIPPARCOS_EPOCH_JD,
+        )
+        assert np.isnan(ra[0]) and np.isnan(dec[0])
+        assert abs(ra[1] - 1.0) < 1e-6
+        ra0, dec0 = update_stars.gliese_b1950_to_icrs([""], [""])
+        assert np.isnan(ra0[0]) and np.isnan(dec0[0])
+
+
+class TestReferencePositions:
+    """A fetch at the wrong epoch must fail the run loudly."""
+
+    @staticmethod
+    def _refs(source, shift=None):
+        stars = []
+        for cid, (ra, dec) in update_stars.REFERENCE_POSITIONS[
+            source
+        ].items():
+            if shift and cid == shift[0]:
+                ra, dec = shift[1]
+            s = _star(cid, 10.0, ra, dec, source=source)
+            s["_catalogue_id"] = cid
+            stars.append(s)
+        return stars
+
+    def test_correct_positions_pass(self):
+        for source in ("hipparcos", "gliese", "gaia"):
+            assert update_stars.check_reference_positions(
+                self._refs(source), source,
+            ) == []
+
+    def test_wrong_epoch_is_rejected(self):
+        """Gl 451 A where VizieR put it in 2026: the B1950-epoch
+        position, 350 arcsec from where it belongs at J2000."""
+        stars = self._refs(
+            "gliese", shift=("Gl 451 A", (178.1738, 37.8002)),
+        )
+        errors = update_stars.check_reference_positions(
+            stars, "gliese",
+        )
+        assert len(errors) == 1
+        assert "Gl 451 A" in errors[0]
+        assert "epoch" in errors[0]
+
+    def test_missing_reference_star_is_rejected(self):
+        errors = update_stars.check_reference_positions(
+            [], "hipparcos",
+        )
+        assert len(errors) == 3
+        assert all("did not return" in e for e in errors)
+
+
+class TestGlieseNames:
+    """Gliese rows are named by catalogue name plus component."""
+
+    def test_component_is_part_of_designation(self):
+        assert update_stars.gliese_name("Gl 451", "A") == "Gl 451 A"
+        assert update_stars.gliese_name("Gl 699", "") == "Gl 699"
+        assert update_stars.gliese_name("Gl  866", "AB") == "Gl 866 AB"
+
+    def test_component_designations_map_to_common_names(self):
+        names = update_stars.GLIESE_COMMON_NAMES
+        assert names["Gl 559 A"] == "Alpha Centauri A"
+        assert names["Gl 559 B"] == "Alpha Centauri B"
+        assert names["Gl 860 B"] == "Kruger 60 B"
+        assert names["Gl 725 A"] == "Struve 2398 A"
+        assert names["Gl 406"] == "Wolf 359"
+
+    def test_components_of_one_system_never_merge(self):
+        """Gl 4 A and Gl 4 B share a row name in the catalogue;
+        with the component in the designation they are two
+        stars, and the same-source rule keeps them apart."""
+        a = _star("Gl 4 A", 37.5, 1.4219, 45.8115, source="gliese")
+        b = _star("Gl 4 B", 37.5, 1.4220, 45.8114, source="gliese")
+        assert not _same_star(a, b)
+        assert len(merge_catalogues([a, b])) == 2
+
+
+class TestMergedPosition:
+    """The merged position follows the most reliable distance."""
+
+    def test_gaia_position_replaces_gliese_position(self):
+        gliese = [_star(
+            "Gl 451 A", 28.1169, 178.2441, 37.7196, source="gliese",
+        )]
+        gaia = [_star(
+            "Gaia DR3 4034171629042489088", 29.9137,
+            178.2449, 37.7187, source="gaia", band="G",
+        )]
+        merged = merge_catalogues(gliese, gaia)
+        assert len(merged) == 1
+        assert merged[0]["distance_ly"] == 29.9137
+        assert merged[0]["ra_deg"] == 178.2449
+        assert merged[0]["dec_deg"] == 37.7187
+
+    def test_hipparcos_position_survives_gliese_merge(self):
+        hip = [_star(
+            "Delta Pavonis", 19.893, 302.1817, -66.1821,
+            source="hipparcos", hip=99240,
+        )]
+        gliese = [_star(
+            "Gl 780", 18.62, 302.1830, -66.1819, source="gliese",
+        )]
+        merged = merge_catalogues(hip, gliese)
+        assert merged[0]["ra_deg"] == 302.1817
+        assert merged[0]["dec_deg"] == -66.1821
+
+
+class TestOverrideMismatch:
+    """An override must land on the star it names."""
+
+    def test_override_on_wrong_star_is_flagged(self):
+        """HIP 86990 (GJ 693) used to be labelled Kapteyn's Star;
+        the override then overwrote GJ 693 with Kapteyn's data
+        while the real Kapteyn's Star stayed listed as HIP 24186."""
+        s = _star(
+            "Kapteyn's Star", 18.954, 266.6426, -57.3190,
+            source="hipparcos", hip=86990,
+        )
+        assert update_stars.apply_overrides([s]) == 1
+        errors = [
+            e for e in validate_catalogue([s])
+            if e.startswith("OVERRIDE_MISMATCH")
+        ]
+        assert len(errors) == 1
+        assert "Kapteyn's Star" in errors[0]
+
+    def test_override_on_right_star_passes(self):
+        s = _star(
+            "Kapteyn's Star", 12.8308, 77.9191, -45.0184,
+            source="hipparcos", hip=24186,
+        )
+        update_stars.apply_overrides([s])
+        assert s["distance_ly"] == 12.777
+        assert not [
+            e for e in validate_catalogue([s])
+            if e.startswith("OVERRIDE_MISMATCH")
+        ]
+
+
+class TestCuratedTables:
+    """Static consistency of the hand-verified tables."""
+
+    def test_hip_names_are_unique(self):
+        names = list(update_stars.HIP_COMMON_NAMES.values())
+        assert len(names) == len(set(names))
+
+    def test_no_name_is_both_curated_and_overridden(self):
+        extras = {e["name"] for e in update_stars.EXTRA_STARS}
+        assert not extras & set(update_stars.KNOWN_STAR_OVERRIDES)
+
+    def test_curated_coordinates_are_in_range(self):
+        rows = list(update_stars.KNOWN_STAR_OVERRIDES.values())
+        rows += update_stars.EXTRA_STARS
+        for row in rows:
+            assert 0 <= row["ra_deg"] < 360
+            assert -90 <= row["dec_deg"] <= 90
+
+    def test_reference_stars_agree_across_sources(self):
+        """The three reference stars are the same objects in
+        every catalogue, so their expected positions must match."""
+        refs = update_stars.REFERENCE_POSITIONS
+        assert (
+            list(refs["hipparcos"].values())
+            == list(refs["gliese"].values())
+            == list(refs["gaia"].values())
         )

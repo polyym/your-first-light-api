@@ -19,6 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from starlette.responses import Response
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from src.compute import (
     DATA_MANIFEST,
@@ -45,13 +46,82 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Your First Light",
     description="Post your birthday. Discover your cosmic reach.",
-    version="1.1.2",
+    version="1.1.3",
 )
 
 # NOTE: CORSMiddleware is registered at the bottom of this module,
 # after the rate-limiting and logging middleware, so that it wraps
 # them and 429 responses also carry CORS headers.
 app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+
+# -------------------------------------------------------------------
+# Request body size limit
+# -------------------------------------------------------------------
+# A valid request body is a few hundred bytes. Without a cap, every
+# request body is read into memory in full before validation, so a
+# client could post megabytes of JSON per request and the only cost
+# to it would be a rate-limit slot that is refunded on the 422.
+MAX_BODY_BYTES = 64 * 1024
+
+
+class BodySizeLimitMiddleware:
+    """Reject request bodies larger than ``MAX_BODY_BYTES``.
+
+    Pure ASGI middleware, registered innermost so its 413 flows
+    out through the rate limiter (which refunds the slot), the
+    access log and CORS like any other error. The declared
+    ``Content-Length`` is checked before the body is read, and a
+    body streamed without one (chunked encoding) is counted as it
+    arrives. The limit is enforced by raising ``HTTPException``
+    from the receive channel, which FastAPI turns into the same
+    JSON error shape every other status uses.
+    """
+
+    def __init__(self, app: ASGIApp, max_bytes: int) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(
+        self, scope: Scope, receive: Receive, send: Send,
+    ) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        declared: int | None = None
+        for name, value in scope.get("headers", []):
+            if name == b"content-length":
+                try:
+                    declared = int(value)
+                except ValueError:
+                    declared = self.max_bytes + 1
+                break
+
+        received = 0
+        limit = self.max_bytes
+        detail = (
+            f"Request body too large; the limit is "
+            f"{limit // 1024} KB."
+        )
+
+        async def limited_receive() -> Message:
+            nonlocal received
+            if declared is not None and declared > limit:
+                raise HTTPException(status_code=413, detail=detail)
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > limit:
+                    raise HTTPException(
+                        status_code=413, detail=detail,
+                    )
+            return message
+
+        await self.app(scope, limited_receive, send)
+
+
+app.add_middleware(BodySizeLimitMiddleware, max_bytes=MAX_BODY_BYTES)
 
 
 # -------------------------------------------------------------------
@@ -124,12 +194,22 @@ async def validation_exception_handler(
     errors = exc.errors()
     if errors:
         first = errors[0]
-        loc = ".".join(
-            str(part) for part in first.get("loc", ())
-            if part != "body"
-        )
-        msg = first.get("msg", "Invalid request.")
-        detail = f"{loc}: {msg}" if loc else msg
+        kind = first.get("type")
+        loc_parts = tuple(first.get("loc", ()))
+        if kind == "json_invalid":
+            detail = "Request body is not valid JSON."
+        elif loc_parts == ("body",) and kind == "missing":
+            detail = "Request body is required."
+        elif loc_parts == ("body",) and kind in (
+            "model_attributes_type", "dict_type",
+        ):
+            detail = "Request body must be a JSON object."
+        else:
+            loc = ".".join(
+                str(part) for part in loc_parts if part != "body"
+            )
+            msg = first.get("msg", "Invalid request.")
+            detail = f"{loc}: {msg}" if loc else msg
     else:
         detail = "Invalid request."
     return JSONResponse(
@@ -417,7 +497,12 @@ def parse_little_endian(s: str) -> date:
 # -------------------------------------------------------------------
 # Root index (root level — no version prefix, not rate limited)
 # -------------------------------------------------------------------
+# Uptime monitors commonly probe with HEAD, which FastAPI does not
+# add to GET routes automatically; the HEAD twin is registered
+# separately and kept out of the schema so the GET stays the only
+# documented operation.
 @app.get("/")
+@app.head("/", include_in_schema=False)
 def index() -> dict[str, object]:
     """Small JSON index so the base URL is not a bare 404.
 
@@ -438,14 +523,18 @@ def index() -> dict[str, object]:
 # Health (root level — no version prefix)
 # -------------------------------------------------------------------
 @app.get("/health")
-def health() -> dict[str, object]:
+@app.head("/health", include_in_schema=False)
+def health() -> JSONResponse:
     """Readiness probe — verifies data files are loaded.
 
     Returns:
-        A dict with ``status`` (``"ok"`` or ``"degraded"``),
-        ``stars_loaded`` and ``eclipses_loaded`` counts, and,
-        when data/manifest.json exists, a ``data_updated``
-        mapping of data file to the date it last changed.
+        A JSON response with ``status`` (``"ok"`` or
+        ``"degraded"``), ``stars_loaded`` and ``eclipses_loaded``
+        counts, and, when data/manifest.json exists, a
+        ``data_updated`` mapping of data file to the date it
+        last changed. A degraded service answers 503 so platform
+        health checks, which look only at the status code, take
+        it out of rotation.
     """
     stars = len(NEARBY_STARS)
     eclipses = len(SOLAR_ECLIPSE_DATES)
@@ -461,7 +550,7 @@ def health() -> dict[str, object]:
             name: info.get("updated")
             for name, info in manifest_files.items()
         }
-    return payload
+    return JSONResponse(payload, status_code=200 if ok else 503)
 
 
 # -------------------------------------------------------------------
@@ -542,6 +631,17 @@ _ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
         "description": (
             "Rate limited (1 request per 30 s per IP)."
         ),
+    },
+    413: {
+        "model": ErrorResponse,
+        "description": (
+            f"Request body larger than "
+            f"{MAX_BODY_BYTES // 1024} KB."
+        ),
+    },
+    500: {
+        "model": ErrorResponse,
+        "description": "Unexpected server error.",
     },
 }
 
@@ -628,8 +728,12 @@ if __name__ == "__main__":
     # TRUSTED_PROXY_HOPS setting, not by uvicorn: trusting
     # X-Forwarded-For from any peer would let clients spoof
     # their rate-limit identity on a directly exposed port.
+    # The request-logging middleware already writes one line per
+    # request with the resolved client IP and duration, so
+    # uvicorn's own access log would only duplicate it.
     uvicorn.run(
         "src.app:app",
         host="0.0.0.0",
         port=int(os.environ.get("PORT", "8000")),
+        access_log=False,
     )

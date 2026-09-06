@@ -617,12 +617,20 @@ def compute_first_light(
     """
     t_birth = Time(birth.isoformat(), format="iso")
     t_ref = Time(ref.isoformat(), format="iso")
+    # astropy subtracts UTC instants on the TAI scale, so this is
+    # the physically elapsed time: it includes every leap second
+    # inserted between the two dates. That is the right basis for
+    # the light-sphere radius and Earth's rotations, and it is
+    # what age_seconds reports (documented in the model). The
+    # calendar-day count comes from date arithmetic instead of
+    # truncating the elapsed days, which would be one day short
+    # if a negative leap second were ever inserted.
     delta = t_ref - t_birth
     age_years = delta.to(u.yr).value
-    age_days = int(delta.to(u.day).value)
+    age_days = (ref - birth).days
     age_seconds = int(delta.to(u.s).value)
-    age_hours = int(age_seconds / 3600)
-    age_minutes = int(age_seconds / 60)
+    age_hours = age_seconds // 3600
+    age_minutes = age_seconds // 60
 
     # Light sphere radius — cheap, needed by several categories
     radius_ly = age_years
@@ -906,11 +914,13 @@ def compute_first_light(
             ),
             ScaleComparison(
                 label=(
-                    "Time to cross at Voyager 1 speed "
-                    "(17 km/s)"
+                    f"Time to cross at Voyager 1 speed "
+                    f"({VOYAGER_1_SPEED_KM_S:g} km/s)"
                 ),
                 value=round(
-                    diameter_km / 17 / SECONDS_PER_YEAR, 2,
+                    diameter_km / VOYAGER_1_SPEED_KM_S
+                    / SECONDS_PER_YEAR,
+                    2,
                 ),
                 unit="years",
             ),

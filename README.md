@@ -10,8 +10,8 @@ Each endpoint accepts a different date format to avoid day/month ambiguity (is `
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/` | JSON index (name, version, endpoint paths) |
-| `GET` | `/health` | Health check, data counts and freshness |
+| `GET`, `HEAD` | `/` | JSON index (name, version, endpoint paths) |
+| `GET`, `HEAD` | `/health` | Health check, data counts and freshness; 503 when a catalogue failed to load |
 | `POST` | `/v1/big-endian-first-light` | Birthday as `YYYY-MM-DD` |
 | `POST` | `/v1/middle-endian-first-light` | Birthday as `MM/DD/YYYY` |
 | `POST` | `/v1/little-endian-first-light` | Birthday as `DD/MM/YYYY` |
@@ -48,7 +48,7 @@ Here is a response for `{"birthday": "2002-10-14", "categories": ["time_alive", 
   "age_days": 8580,
   "age_hours": 205920,
   "age_minutes": 12355200,
-  "age_seconds": 741312000,
+  "age_seconds": 741312005,
   "earth_rotations": 8603.49,
   "leap_years_lived_through": 6,
   "nasa_apod_url": "https://apod.nasa.gov/apod/ap021014.html"
@@ -59,7 +59,7 @@ The full response schema with all 15 categories is available at `/docs` when the
 
 ### Response categories
 
-- **time_alive** -- age in years/days/hours/minutes/seconds, sidereal earth rotations, leap years
+- **time_alive** -- age in years/days/hours/minutes/seconds, sidereal earth rotations, leap years. `age_seconds` is physically elapsed time, so it includes the leap seconds inserted during your lifetime (five in the example above) and can exceed `age_days` x 86400 by a few seconds; hours and minutes derive from it
 - **moon** -- phase at midnight UTC (name, illumination, moon age in days), full moons since birth, next full moon date
 - **light_sphere** -- radius/diameter in light-years/km/AU, volume, surface area, Milky Way and observable universe coverage
 - **stars** -- reached count, naked-eye count, stars reached in the past year, birthday star, full star list with distance/spectral type/magnitude/exoplanets/RA/Dec coordinates (J2000), next star with arrival date
@@ -83,6 +83,7 @@ All errors return JSON with a `detail` field that is always a plain string, incl
 |--------|---------|---------|
 | `422` | Invalid date, future date, or invalid request fields | `{"detail": "Invalid date: 'bad'. Expected YYYY-MM-DD."}` |
 | `429` | Rate limited | `{"detail": "Rate limited. Please wait 25.3 seconds before trying again."}` |
+| `413` | Request body over 64 KB | `{"detail": "Request body too large; the limit is 64 KB."}` |
 | `500` | Server error | `{"detail": "An unexpected error occurred."}` |
 
 `429` responses include a `Retry-After` header (seconds). All responses, including `429` and `500`, carry CORS headers so browser clients can read them.
@@ -179,7 +180,8 @@ requirements.lock -- fully pinned dependency set used by the Docker image
 
 ## Updating data
 
-Data updates are automated. A scheduled GitHub Actions workflow (`.github/workflows/update-data.yml`) runs monthly: it regenerates both catalogues from their upstream sources, validates them, runs the full test suite against the refreshed data, and opens a pull request only when the data actually changed. Review the diff and merge; nothing lands on `main` without a human looking at it. The workflow can also be triggered manually from the Actions tab.
+Data updates are automated. A scheduled GitHub Actions workflow (`.github/workflows/update-data.yml`) runs monthly: it regenerates both catalogues from their upstream sources, validates them, runs the full test suite against the refreshed data, and opens a pull request only when the data actually changed. Review the diff and merge; nothing lands on `main` without a human looking at it. The workflow can also be triggered manually from the Actions tab. It needs one repository setting that cannot be expressed in YAML: "Allow GitHub Actions to create and approve pull requests" under Settings, Actions, General, Workflow permissions. Without it the run pushes the `data/refresh` branch and then fails at the final step.
+
 
 To refresh locally instead, install the catalogue extra and run the same entry point:
 
@@ -197,7 +199,7 @@ The script never installs packages itself; if `astroquery` is missing it prints 
 | `data/stars.json` | HIPPARCOS, Gliese, Gaia DR3, NASA Exoplanet Archive | `tools/updaters/update_stars.py` |
 | `data/eclipses.json` | NASA Five Millennium Catalog of Eclipses | `tools/updaters/update_eclipses.py` |
 
-Both updaters auto-fix data quality issues (cross-catalogue deduplication with distance-scaled tolerances, spectral type normalisation, Gaia G to V magnitude conversion) and validate before writing, including a positional-duplicate check that fails the run if the same star appears twice under different designations. Degraded fetches also fail the run: every upstream source must return at least half of its expected row count, and eclipse coverage is checked per year, so a partially failed refresh can never produce a plausible-looking but incomplete data file. Writes are atomic (temp file plus rename), so an interrupted run can never leave a truncated catalogue, and files are only rewritten when their content actually changed. `data/manifest.json` records the source, entry count, and last-changed date for each file, which `/health` reports as `data_updated`.
+Both updaters auto-fix data quality issues (cross-catalogue deduplication with distance-scaled tolerances, spectral type normalisation, Gaia G to V magnitude conversion) and validate before writing, including a positional-duplicate check that fails the run if the same star appears twice under different designations. Star positions are propagated to epoch J2000.0 by the updater itself from each catalogue's native astrometry (HIPPARCOS J1991.25, Gaia DR3 J2016.0, Gliese B1950.0) rather than taken from VizieR's computed columns, whose behaviour changed upstream in 2026. Degraded fetches also fail the run: every upstream source must return at least half of its expected row count and must place three fast-moving reference stars (Barnard's Star, Groombridge 1830, Kapteyn's Star) within 20 arcseconds of their known J2000 positions, hand-curated overrides must land on an entry whose catalogue position agrees with them, and eclipse coverage is checked per year, so a partially failed, wrong-epoch or mis-mapped refresh can never produce a plausible-looking but wrong data file. Writes are atomic (temp file plus rename), so an interrupted run can never leave a truncated catalogue, and files are only rewritten when their content actually changed. `data/manifest.json` records the source, entry count, and last-changed date for each file, which `/health` reports as `data_updated`.
 
 ## Data sources
 
@@ -212,7 +214,7 @@ Both updaters auto-fix data quality issues (cross-catalogue deduplication with d
 
 ## AI usage
 
-Claude Sonnet 4.6 Extended (Anthropic) wrote all of the tests for v1.0 and assisted with some of the documentation. Claude Opus 4.8 (Anthropic) implemented the v1.1 changes, working from a human-reviewed code review; see CHANGELOG.md.
+Claude Sonnet 4.6 Extended (Anthropic) wrote all of the tests for v1.0 and assisted with some of the documentation. Claude Opus 4.8 (Anthropic) implemented the v1.1 changes, working from a human-reviewed code review; Claude Fable 5.1 (Anthropic) diagnosed and implemented the v1.1.3 data-pipeline fixes after the first automated refresh produced a corrupt catalogue; see CHANGELOG.md.
 
 ## Python version
 

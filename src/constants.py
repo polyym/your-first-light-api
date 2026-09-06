@@ -74,6 +74,7 @@ VOYAGER_1_MILESTONES: tuple[tuple[date, float], ...] = (
     (date(2015, 1, 1), 130.02),
     (date(2020, 1, 1), 147.87),
     (date(2025, 1, 1), 165.70),
+    (date(2026, 1, 1), 169.26),
 )
 
 VOYAGER_2_MILESTONES: tuple[tuple[date, float], ...] = (
@@ -90,6 +91,7 @@ VOYAGER_2_MILESTONES: tuple[tuple[date, float], ...] = (
     (date(2018, 11, 5), 119.01),    # Entered interstellar space
     (date(2020, 1, 1), 122.68),
     (date(2025, 1, 1), 138.55),
+    (date(2026, 1, 1), 141.71),
 )
 
 # ---------------------------------------------------------------------------
