@@ -1,0 +1,63 @@
+# The checks for every push to main and every pull request. On a data
+# refresh pull request, which the workflow opens with its own token,
+# GitHub runs them only once someone with write access approves the run;
+# update-data.yml has already run the same checks except the image.
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # A branch rule on main may ask for this job by the name "test".
+  test:
+    runs-on: ubuntu-latest
+    # A test that never returns must fail the run, not hold a runner for
+    # GitHub's own limit of six hours.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Installs the Python in .python-version and the exact versions in
+      # uv.lock, the same ones the image ships.
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Check formatting
+        run: uv run ruff format --check .
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Type check
+        run: uv run mypy
+
+      - name: Run tests
+        run: uv run pytest -q
+
+      - name: Build the image
+        run: docker build -t first-light .
+
+      # The image is what Render runs, so it must start and load its data.
+      - name: Start the image
+        run: |
+          docker run -d --name api -p 8000:8000 first-light
+          for _ in $(seq 30); do
+            if curl -fsS http://localhost:8000/health; then exit 0; fi
+            sleep 1
+          done
+          docker logs api
+          exit 1

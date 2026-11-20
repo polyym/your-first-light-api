@@ -1,0 +1,57 @@
+# Weekly update pull requests, which the Tests workflow judges. Minor and
+# patch updates of Python packages come in two groups. Each major update
+# comes on its own, to be read before merging, as does a release whose
+# version moves only past its third part, such as the weekly
+# astropy-iers-data. The cooldown holds a new release back for a week,
+# since a broken or malicious one is usually withdrawn within days.
+version: 2
+updates:
+  - package-ecosystem: uv
+    directory: /
+    # uv.lock pins every package, and Dependabot otherwise updates only
+    # those named in pyproject.toml. This brings in the rest, among them
+    # anyio and the leap-second table astropy reads with downloads off.
+    allow:
+      - dependency-type: all
+    schedule:
+      interval: weekly
+    groups:
+      # Updates of the web stack change response headers and error
+      # messages that contract tests pin, so they come apart from the
+      # rest and are read before merging. opentelemetry-api is with them
+      # because FastAPI asks it on every request whether telemetry is
+      # set up. A package joins the first group that matches it, so this
+      # one comes first.
+      web:
+        patterns:
+          - fastapi
+          - starlette
+          - uvicorn
+          - pydantic
+          - pydantic-core
+          - anyio
+          - opentelemetry-api
+        update-types: [minor, patch]
+      minor-and-patch:
+        update-types: [minor, patch]
+    cooldown:
+      default-days: 7
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    ignore:
+      # The Python version moves by hand, with .python-version, so that
+      # the tests run on it too; only new builds of 3.13-slim come here.
+      - dependency-name: python
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor

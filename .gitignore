@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Left behind by an updater run that crashed mid-write.
+data/*.tmp

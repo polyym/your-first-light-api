@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: your-first-light
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      # Pin the port rather than relying on Render's
+      # best-effort detection; the Dockerfile CMD reads it.
+      - key: PORT
+        value: "8000"
+      # Render fronts every service with Cloudflare and sets
+      # True-Client-IP to the verified caller address. The
+      # X-Forwarded-For chain contains a variable number of
+      # platform hops here, so a fixed hop count is unreliable;
+      # the platform header is the supported way to identify
+      # callers.
+      - key: CLIENT_IP_HEADER
+        value: "True-Client-IP"

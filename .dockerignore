@@ -1,0 +1,9 @@
+# The image needs only what is listed here.
+*
+!pyproject.toml
+!uv.lock
+!src/
+!data/
+**/__pycache__/
+# An updater run that crashed mid-write leaves one of these behind.
+data/*.tmp

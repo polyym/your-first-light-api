@@ -1,0 +1,14 @@
+{
+  "files": {
+    "eclipses.json": {
+      "source": "NASA Five Millennium Catalog of Eclipses (eclipse.gsfc.nasa.gov)",
+      "entries": 913,
+      "updated": "2026-04-11"
+    },
+    "stars.json": {
+      "source": "HIPPARCOS (ESA), Gliese Catalogue of Nearby Stars, Gaia DR3 (ESA), NASA Exoplanet Archive",
+      "entries": 49413,
+      "updated": "2026-09-06"
+    }
+  }
+}
