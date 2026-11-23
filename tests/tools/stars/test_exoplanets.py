@@ -107,6 +107,29 @@ def test_each_host_counts_its_own_planets(archive):
     }
 
 
+def test_gaia_source_of_an_unresolved_pair_counts_both_hosts(archive):
+    """HD 41004 A and B, half an arcsecond apart, have a planet each.
+
+    The archive gives the pair's one Gaia source to B alone.
+    """
+    archive.answers = [
+        Table(
+            {
+                "hostname": ["HD 41004 A", "HD 41004 B"],
+                "hip_name": ["HIP 28393 A", "HIP 28393 B"],
+                "hd_name": ["HD 41004 A", "HD 41004 B"],
+                "gaia_dr3_id": MaskedColumn(
+                    ["", "Gaia DR3 4794830231453653888"], mask=[True, False]
+                ),
+            }
+        )
+    ]
+    counts = fetch_exoplanet_counts()
+    assert counts["Gaia DR3 4794830231453653888"] == 2
+    assert counts["HIP 28393"] == 2
+    assert counts["HD 41004 B"] == 1
+
+
 def test_gaia_source_finds_a_host_the_archive_names_differently(make_star):
     """L 98-59 is a Gaia row alone here; LHS 1140 is NN 3053 in Gliese."""
     gaia_only = make_star("Gaia DR3 5271055243163629056", 34.6, 124.5, -68.3)

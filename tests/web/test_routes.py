@@ -81,7 +81,7 @@ NEIGHBOURS = [
         "spectral_type": "M4.0V",
         "apparent_magnitude": 9.51,
         "magnitude_band": "V",
-        "known_exoplanets": 1,
+        "known_exoplanets": 4,
         "ra_deg": 269.4521,
         "dec_deg": 4.6934,
     },
@@ -101,7 +101,7 @@ NEIGHBOURS = [
         "spectral_type": "M5.5Ve",
         "apparent_magnitude": 11.13,
         "magnitude_band": "V",
-        "known_exoplanets": 3,
+        "known_exoplanets": 2,
         "ra_deg": 217.4289,
         "dec_deg": -62.6795,
     },
@@ -117,7 +117,7 @@ NEIGHBOURS_BODY = (
     b'"spectral_type":"M4.0V","difference_ly":0.92},'
     b'"stars":[{"name":"Proxima Centauri","distance_ly":4.25,'
     b'"spectral_type":"M5.5Ve","spectral_class":"Red dwarf (M)",'
-    b'"apparent_magnitude":11.13,"magnitude_band":"V","known_exoplanets":3,'
+    b'"apparent_magnitude":11.13,"magnitude_band":"V","known_exoplanets":2,'
     b'"your_age_at_light_arrival_years":4.25,'
     b'"light_arrival_date":"2024-03-31","naked_eye_visible":false,'
     b'"ra_deg":217.4289,"dec_deg":-62.6795},'

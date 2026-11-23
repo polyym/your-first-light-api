@@ -59,7 +59,7 @@ The response to `{"birthday": "1998-11-15", "as_of": "2026-04-11", "categories":
 
 ### Response categories
 
-- **time_alive**: age in years, days, hours, minutes and seconds, sidereal Earth rotations, and 29 Februaries lived through. `age_seconds` is physically elapsed time, so it includes the leap seconds inserted during the lifetime (five in the example above) and differs from `age_days` x 86,400 by the leap seconds in between: up to 27 more for a birthday since 1972 or 37 for an earlier one, or one fewer for a short span across UTC's backward steps of 1961 and 1968. Hours and minutes derive from it.
+- **time_alive**: age in years, days, hours, minutes and seconds, sidereal Earth rotations, and 29 Februaries lived through. `age_seconds` is physically elapsed time, so it includes the leap seconds inserted during the lifetime (six in the example above) and differs from `age_days` x 86,400 by the leap seconds in between: up to 27 more for a birthday since 1972 or 37 for an earlier one, or one fewer for a short span across UTC's backward steps of 1961 and 1968. Hours and minutes derive from it.
 - **moon**: the phase at midnight UTC on the birthday (name, illumination, age in the cycle), the full moons since, and the date of the next. Full moons are the instants the Moon is 180 degrees from the Sun in ecliptic longitude.
 - **light_sphere**: radius in light-years, km and AU, diameter, volume, surface area, the share of the Milky Way and the observable universe, and the speed of light.
 - **stars**: stars reached, those visible to the naked eye and those reached in the past year, the birthday star, the list of stars with distance, spectral type and class, magnitude, exoplanets and J2000 coordinates, and the next star with its arrival date.
@@ -156,20 +156,22 @@ uv run python tools/update_data.py stars     # stars only
 uv run python tools/update_data.py eclipses  # eclipses only
 ```
 
-Each upstream fetch is retried, and HIPPARCOS and Gliese fall back to VizieR's CfA mirror when the CDS host fails. The star catalogue is then built by these rules:
+Each upstream fetch is retried, and Gliese falls back to VizieR's CfA mirror when the CDS host fails. The star catalogue is then built by these rules:
 
-- A Gaia row whose astrometric solution fits poorly (RUWE above 1.4) and whose parallax is under 20 standard errors is left out, since such a parallax is likely spurious. So are seven HIPPARCOS entries that Gaia shows are not nearby stars.
-- Rows from different catalogues are merged into one entry where their positions, or their positions and distances, agree. A Gliese row is also joined to the Gaia or HIPPARCOS row within 180 arcseconds whose V magnitude is within 0.2 of its own, whatever their distances, since Gliese distances for faint stars are estimates.
+- HIPPARCOS distances and positions come from its 2007 reduction, and its V magnitudes and spectral types from the 1997 catalogue. A HIPPARCOS star whose Gaia DR3 match is within 2 magnitudes of its V and has a sound parallax takes Gaia's distance and position instead, and joins that Gaia row and no other. Once the catalogues are merged, every entry beyond 160 light-years is left out, with any Gliese row joined to it or given its distance.
+- A Gaia row whose astrometric solution fits poorly (RUWE above 1.4) and whose parallax is under 20 standard errors is left out, since such a parallax is likely spurious. So are eight HIPPARCOS entries that Gaia shows are not nearby stars, and twenty Gliese rows that list a second time a star another entry holds.
+- Rows from different catalogues are merged into one entry where their positions, or their positions and distances, agree. A Gliese row is also joined to the Gaia or HIPPARCOS row within 180 arcseconds whose V magnitude is within 0.2 of its own, whatever their distances, since Gliese distances for faint stars are estimates. Within the Gliese catalogue's position errors, rows of like magnitude pair first.
+- A component of a Gliese multiple star that no other catalogue lists takes the distance of a component that HIPPARCOS or Gaia measured.
 - Each star takes the first of its catalogues' spectral types that its brightness allows. When none fits, a type refused only for its giant luminosity class is cut back to its temperature class (`K5III` to `K5`).
-- Gaia gives no spectral types, so a Gaia star's is estimated from its colour and absolute magnitude and marked `(est)`; a red star far too faint for a red dwarf, with a parallax of at least 20 standard errors, is estimated a brown dwarf, `L (est)`.
-- A star's planet count is the number of its own rows in the NASA Exoplanet Archive, matched by Gaia DR3 source, name or HIP number. For a star the archive lists, that count replaces the curated table's.
+- Gaia gives no spectral types, so a Gaia star's is estimated from its colour and absolute magnitude and marked `(est)`. A red star too faint for a red dwarf is estimated a brown dwarf, `L (est)`, only when its parallax is at least 50 standard errors, and gets no estimate otherwise. A star of BP-RP 1.0 to 2.0 far below the main sequence is estimated a white dwarf, `D (est)`, only with such a parallax too.
+- A star's planet count is the number of its own rows in the NASA Exoplanet Archive, matched by Gaia DR3 source, name or HIP number. For a pair that HIPPARCOS or Gaia lists as one star, the count is the pair's. For a star the archive lists, that count replaces the curated table's.
 - Positions are propagated to J2000 by the updater itself from each catalogue's own astrometry.
 
 The updaters validate everything before writing:
 
 - Every source must return a minimum number of rows: 3,000 from HIPPARCOS, 1,500 from Gliese, 20,000 from Gaia and 1,000 Exoplanet Archive names.
-- The Gaia answer must hold every row the archive counts as matching, each once.
-- Three fast-moving reference stars must sit within 20 arcseconds of their known J2000 positions.
+- Each answer from the Gaia archive, for HIPPARCOS and for Gaia, must hold every row the archive counts as matching, each once.
+- Three fast-moving reference stars must sit within 20 arcseconds of their known J2000 positions, and HIPPARCOS must give each its Gaia DR3 match.
 - Two entries from different catalogues within 15 arcseconds of each other must agree in distance to within 5 per cent, or half a light-year if that is more: a pair that does not is one star listed twice. Pairs more than 5 magnitudes apart and pairs of named stars are exempt. No name may appear twice.
 - A spectral type is refused for a star too faint for its class, a bare M type for a star too bright for a red dwarf, and a giant luminosity class (I to III) for a star too faint to be a giant.
 - Curated overrides must land on the right star.
@@ -181,7 +183,7 @@ A failed or degraded fetch fails the run, so a plausible-looking but wrong catal
 
 | Data | Source |
 |------|--------|
-| Star positions and properties | HIPPARCOS and the Gliese Catalogue of Nearby Stars (through VizieR at CDS, or its CfA mirror), and Gaia DR3 (ESA Gaia archive) |
+| Star positions and properties | HIPPARCOS and Gaia DR3 (ESA Gaia archive), and the Gliese Catalogue of Nearby Stars (through VizieR at CDS, or its CfA mirror) |
 | Exoplanet counts | NASA Exoplanet Archive |
 | Eclipse dates | NASA Five Millennium Catalog of Eclipses (GSFC) |
 | Moon and Sun positions | astropy's built-in analytical ephemeris (ERFA). From about 1700 to 2100 its error is far below the rounding of the values returned. Further away the slowing of the Earth's rotation, which is not modelled, shifts midnight UTC, by three hours in year 1, and the Moon's figures with it |

@@ -7,12 +7,14 @@ import pytest
 from tools.updaters.stars.curated import (
     EXTRA_STARS,
     KNOWN_STAR_OVERRIDES,
+    REFERENCE_GAIA_MATCHES,
     REFERENCE_POSITIONS,
 )
 from tools.updaters.stars.merge import apply_overrides
 from tools.updaters.stars.validate import (
     MIN_FETCH_COUNTS,
     check_fetch_counts,
+    check_reference_matches,
     check_reference_positions,
     find_positional_duplicates,
     validate_catalogue,
@@ -338,3 +340,32 @@ def test_override_on_right_star_passes(make_star):
     assert not [
         e for e in validate_catalogue([s]) if e.startswith("OVERRIDE_MISMATCH")
     ]
+
+
+def _hipparcos_references(gaia_ids: dict[str, str | None]) -> list[dict]:
+    stars = []
+    for cid, gaia_id in gaia_ids.items():
+        star = {"_catalogue_id": cid}
+        if gaia_id:
+            star["_gaia_id"] = gaia_id
+        stars.append(star)
+    return stars
+
+
+def test_hipparcos_references_with_their_gaia_matches_pass():
+    stars = _hipparcos_references(dict(REFERENCE_GAIA_MATCHES))
+    assert check_reference_matches(stars) == []
+
+
+def test_hipparcos_reference_without_its_gaia_match_fails():
+    """As every star would be, were Gaia's match table missing."""
+    gaia_ids: dict[str, str | None] = dict(REFERENCE_GAIA_MATCHES)
+    gaia_ids["87937"] = None
+    (error,) = check_reference_matches(_hipparcos_references(gaia_ids))
+    assert error.startswith("MATCH: hipparcos 87937 lacks its Gaia DR3 match")
+
+
+def test_hipparcos_reference_with_another_match_fails():
+    gaia_ids: dict[str, str | None] = dict(REFERENCE_GAIA_MATCHES)
+    gaia_ids["24186"] = "1"
+    assert len(check_reference_matches(_hipparcos_references(gaia_ids))) == 1

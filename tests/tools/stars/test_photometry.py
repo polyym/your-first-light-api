@@ -33,9 +33,17 @@ def test_faint_blue_object_is_white_dwarf():
     assert estimate_spectral_class(-0.1, 8.5, 8.6) == "D (est)"
 
 
-def test_missing_or_out_of_range_colour_gives_no_estimate():
+def test_missing_colour_gives_no_estimate():
     assert estimate_spectral_class(None, 10.0, 30.0) == ""
-    assert estimate_spectral_class(6.0, 10.0, 30.0) == ""
+
+
+def test_red_dwarf_redder_than_bp_rp_5_is_still_m():
+    """Gaia DR3 2091177593123254016: BP-RP 5.151, G 14.851, 18.5534 ly.
+
+    LSR J1835+3259, M8.5V. By hand its absolute G is 16.08, brighter
+    than the faintest red dwarf.
+    """
+    assert estimate_spectral_class(5.151, 14.851, 18.5534) == "M (est)"
 
 
 @pytest.mark.parametrize(
@@ -44,12 +52,12 @@ def test_missing_or_out_of_range_colour_gives_no_estimate():
     ids=["g-18.9", "g-19.1"],
 )
 def test_colour_fainter_than_g_19_gives_no_estimate(gmag, expected):
-    """BP-RP 3.0 at 100 ly is an M dwarf at either G.
+    """BP-RP 3.0 at 120 ly is an M dwarf at either G.
 
-    By hand, G - V is -1.54 and the distance modulus 2.43, so absolute
-    V is 18.0 or 18.2.
+    By hand, G - V is -1.54 and the distance modulus 2.83, so absolute
+    V is 17.6 or 17.8, and absolute G 16.07 or 16.27.
     """
-    assert estimate_spectral_class(3.0, gmag, 100.0) == expected
+    assert estimate_spectral_class(3.0, gmag, 120.0) == expected
 
 
 def test_k_colour_too_faint_for_a_k_dwarf_gives_no_estimate():
@@ -66,12 +74,11 @@ def test_m_colour_far_brighter_than_an_m_dwarf_gives_no_estimate():
     assert estimate_spectral_class(2.0, 3.0, 100.0) == ""
 
 
-def test_dwarf_range_is_judged_on_v_not_g():
+def test_red_row_too_faint_for_a_red_dwarf_needs_a_strong_parallax():
     """Gaia DR3 4752399493622045696: BP-RP 4.873, G 18.573, 15.8771 ly.
 
-    By hand, G - V is -3.43 and the distance modulus -1.56, so absolute
-    V is 23.56, beyond M9.5V's 19.75 and the 2 mag margin. Its absolute
-    G, 20.14, would wrongly pass as an M dwarf.
+    By hand its absolute G is 20.14, past M9.5V's 16.40, so it is no
+    red dwarf; with no parallax given, it is no brown dwarf either.
     """
     assert estimate_spectral_class(4.873, 18.573, 15.8771) == ""
 
@@ -100,19 +107,21 @@ def test_red_row_far_fainter_than_any_red_dwarf_is_a_brown_dwarf(
 @pytest.mark.parametrize(
     ("bp_rp", "abs_g", "parallax_snr", "expected"),
     [
-        (3.5, 18.39, 100.0, "M (est)"),
-        (3.5, 18.41, 100.0, "L (est)"),
-        (3.5, 20.0, 19.9, ""),
-        (3.5, 20.0, 20.0, "L (est)"),
+        (3.5, 16.39, 100.0, "M (est)"),
+        (3.5, 16.41, 100.0, "L (est)"),
+        (3.5, 16.41, 49.9, ""),
+        (3.5, 20.0, 49.9, ""),
+        (3.5, 20.0, 50.0, "L (est)"),
         (3.5, 20.0, None, ""),
         (1.83, 19.0, 100.0, ""),
         (1.84, 19.0, 100.0, "L (est)"),
     ],
     ids=[
-        "just-inside-the-margin",
-        "just-past-the-margin",
-        "parallax-under-20-errors",
-        "parallax-of-20-errors",
+        "faintest-red-dwarf",
+        "past-the-faintest-red-dwarf",
+        "past-it-with-a-weaker-parallax",
+        "parallax-under-50-errors",
+        "parallax-of-50-errors",
         "parallax-unknown",
         "orange",
         "red",
@@ -129,6 +138,44 @@ def test_brown_dwarf_estimate_needs_red_faint_and_a_strong_parallax(
 def test_blue_star_below_the_white_dwarf_sequence_gives_no_estimate():
     """Absolute G 17.0 (G 17.0 at 10 pc), fainter than any white dwarf."""
     assert estimate_spectral_class(0.5, 17.0, 32.6156) == ""
+
+
+def test_cool_white_dwarf_is_estimated_from_a_strong_parallax():
+    """Gaia DR3 2202703050401536000, a DAH white dwarf at 27.6 ly.
+
+    BP-RP 1.051, G 14.373, parallax of 7,615 standard errors. By hand
+    its absolute G is 14.74, far below a K dwarf of that colour.
+    """
+    assert estimate_spectral_class(1.051, 14.373, 27.604, 7615) == "D (est)"
+
+
+@pytest.mark.parametrize(
+    ("bp_rp", "abs_g", "parallax_snr", "expected"),
+    [
+        (1.99, 14.0, 50.0, "D (est)"),
+        (2.0, 14.0, 50.0, "M (est)"),
+        (1.5, 14.0, 49.9, ""),
+        (1.5, 12.0, 50.0, ""),
+        (1.5, 12.01, 50.0, "D (est)"),
+        (1.5, 16.5, 50.0, "D (est)"),
+        (1.5, 16.51, 50.0, ""),
+    ],
+    ids=[
+        "just-blue-enough",
+        "too-red",
+        "parallax-under-50-errors",
+        "too-bright",
+        "just-faint-enough",
+        "end-of-the-sequence",
+        "past-the-end",
+    ],
+)
+def test_cool_white_dwarf_estimate_needs_its_colour_magnitude_and_parallax(
+    bp_rp, abs_g, parallax_snr, expected
+):
+    """At 10 pc, so G is the absolute G."""
+    estimate = estimate_spectral_class(bp_rp, abs_g, 32.6156, parallax_snr)
+    assert estimate == expected
 
 
 def test_estimates_group_in_api_breakdown():

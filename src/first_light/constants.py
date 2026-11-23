@@ -6,7 +6,7 @@ Physical and astronomical values live in ``facts.physics``.
 API_TITLE = "Your First Light"
 API_DESCRIPTION = "Post your birthday. Discover your cosmic reach."
 # Must equal the version in pyproject.toml; a test holds them together.
-API_VERSION = "1.0.0"
+API_VERSION = "1.1.0"
 
 # A valid request is a few hundred bytes. Without a cap, a body is read
 # into memory in full before validation, at the cost to the caller of

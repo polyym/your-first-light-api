@@ -11,7 +11,6 @@ from astropy.table import MaskedColumn, Table
 from tools.updaters.retry import FETCH_ATTEMPTS
 from tools.updaters.stars.astrometry import min_parallax_mas
 from tools.updaters.stars.gliese import fetch_gliese
-from tools.updaters.stars.hipparcos import fetch_hipparcos
 from tools.updaters.stars.validate import MAX_RADIUS_LY
 from tools.updaters.stars.vizier import (
     MIN_PARALLAX_SNR,
@@ -223,16 +222,11 @@ def test_row_with_a_zero_or_nan_parallax_or_error_gives_no_distance(
     assert _distance_ly(parallax, error) is None
 
 
-@pytest.mark.parametrize(
-    ("fetch", "column"), [(fetch_hipparcos, "Plx"), (fetch_gliese, "plx")]
-)
-def test_fetch_asks_for_the_exact_parallax_cut(
-    vizier, retry_waits, fetch, column
-):
+def test_fetch_asks_for_the_exact_parallax_cut(vizier, retry_waits):
     """The cut is the parallax at 160 ly, not 20.4 mas (159.88 ly)."""
     vizier.answers[CDS_HOST] = [_EMPTY_ANSWER]
     vizier.answers[CFA_HOST] = [_EMPTY_ANSWER]
-    assert fetch(MAX_RADIUS_LY) == []
+    assert fetch_gliese(MAX_RADIUS_LY) == []
     cut = min_parallax_mas(MAX_RADIUS_LY)
     assert cut == pytest.approx(20.38475)
-    assert vizier.calls[0][1][column] == f">{cut}"
+    assert vizier.calls[0][1]["plx"] == f">{cut}"

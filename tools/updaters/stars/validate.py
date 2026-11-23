@@ -7,6 +7,7 @@ passed.
 from tools.updaters.stars.astrometry import ARCSEC_PER_DEG, angular_sep_deg
 from tools.updaters.stars.curated import (
     KNOWN_STAR_OVERRIDES,
+    REFERENCE_GAIA_MATCHES,
     REFERENCE_POSITIONS,
 )
 from tools.updaters.stars.entry import Star, is_catalogue_id, sources_of
@@ -20,7 +21,7 @@ from tools.updaters.stars.photometry import (
 MAX_RADIUS_LY = 160
 
 # The fewest entries (name keys for the Exoplanet Archive) each fetch
-# may give, well below what each source gives (HIPPARCOS 6,500, Gliese
+# may give, well below what each source gives (HIPPARCOS 9,900, Gliese
 # 3,100 and Gaia 41,800 entries, Exoplanet Archive 10,300 keys). A
 # fetch below its floor failed or silently degraded, and a catalogue
 # built from the rest would look plausible while missing thousands of
@@ -99,6 +100,26 @@ def check_reference_positions(stars: list[Star], source: str) -> list[str]:
                 f"{sep_arcsec:.0f} arcsec from its J2000 position "
                 f"(limit {REFERENCE_MAX_SEP_ARCSEC:.0f}); the "
                 f"fetch is probably at the wrong epoch"
+            )
+    return errors
+
+
+def check_reference_matches(stars: list[Star]) -> list[str]:
+    """Flags a HIPPARCOS fetch whose reference stars lack their Gaia match.
+
+    Args:
+        stars: The entries the HIPPARCOS fetcher returned.
+    """
+    by_id = {s.get("_catalogue_id"): s for s in stars}
+    errors = []
+    for cid, gaia_id in REFERENCE_GAIA_MATCHES.items():
+        star = by_id.get(cid)
+        # A missing star is check_reference_positions' to report.
+        if star is not None and star.get("_gaia_id") != gaia_id:
+            errors.append(
+                f"MATCH: hipparcos {cid} lacks its Gaia DR3 match "
+                f"{gaia_id}; refusing to build a catalogue without "
+                f"Gaia's distances for HIPPARCOS stars"
             )
     return errors
 

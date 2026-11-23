@@ -62,15 +62,50 @@ HIP_COMMON_NAMES: dict[int, str] = {
 }
 
 # HIPPARCOS entries that are not nearby stars, each checked against
-# Gaia DR3. No other catalogue here lists any of them, so nothing
-# would correct the distance HIPPARCOS gives. HIP 114110 and HIP
-# 114176 are the scattered light of a bright star half an arcminute
+# Gaia DR3. No other catalogue here lists any of them. HIP 114110 and
+# HIP 114176 are the scattered light of a bright star half an arcminute
 # away: Gaia has no source there. The rest are stars Gaia puts far
-# beyond the catalogue: HIP 85605, 16 light-years away by its
-# HIPPARCOS parallax, is 1,700 by Gaia's, and HIP 21000, 38 by
-# HIPPARCOS, is 660.
+# beyond the catalogue: HIP 10529, 68 light-years away by its 2007
+# HIPPARCOS parallax, is 778 by Gaia's, which Gaia DR3's own match of
+# HIPPARCOS stars does not link to it. Four would leave anyway, HIP
+# 21000 through its Gaia match and HIP 85605, 98681 and 114176 through
+# 2007 parallaxes under five standard errors, and stay listed in case
+# either source changes.
 SPURIOUS_HIP_IDS = frozenset(
-    {21000, 82724, 82725, 85605, 98681, 114110, 114176}
+    {10529, 21000, 82724, 82725, 85605, 98681, 114110, 114176}
+)
+
+# Gliese rows that list a second time a star another entry already
+# holds, each confirmed with SIMBAD. Beside each is the star and, where
+# the catalogue lists it, the entry that holds it. Their positions are
+# too coarse for the merge to join them, so
+# each would stay as a copy of the star, most at the wrong distance. A
+# component beside a HIPPARCOS entry is too close for HIPPARCOS to
+# resolve, and that entry's V already holds its light: Capella's HIP
+# 24608, at V 0.08, is Gl 194 A and B together.
+DUPLICATE_GLIESE_IDS = frozenset(
+    {
+        "Gl 194 B",  # Capella: HIP 24608
+        "Gl 337 B",  # pi01 Cnc: HIP 45170
+        "Gl 340 B",  # HD 79969: HIP 45617
+        "Gl 340.1 B",  # 128 Car: HIP 45571
+        "Gl 366.1 B",  # theta Ant: Gl 366.1 A
+        "Gl 482 B",  # Porrima: HIP 61941
+        "Gl 534.1 B",  # HD 121384 B: Gaia DR3 6064816017535011072
+        "Gl 644 B",  # HD 152751: HIP 82817
+        "Gl 750 B",  # HD 179930: HIP 94739
+        "Gl 822 B",  # delta Equ: HIP 104858
+        "Gl 828 B",  # L 353-9
+        "Gl 855.1 B",  # nu Ind: HIP 110618
+        "NN 3063",  # Smethells 177: HIP 4189
+        "NN 3101",  # G 274-72
+        "NN 3203",  # AE For: HIP 14568
+        "NN 3231 B",  # HD 21663 B: NN 3232
+        "NN 3419",  # L 814-1
+        "NN 3444",  # LP 88-196
+        "NN 4285",  # L 119-44: Gaia DR3 6392188629658709888
+        "Wo 9490 B",  # BD+20 3010: HIP 71914
+    }
 )
 
 # Common names of Gliese catalogue rows, keyed by the designation
@@ -306,4 +341,14 @@ REFERENCE_POSITIONS: dict[str, dict[str, tuple[float, float]]] = {
         "4034171629042489088": (178.24487, 37.71868),
         "4810594479418041856": (77.91912, -45.01843),
     },
+}
+
+# Gaia DR3's match of each HIPPARCOS reference star, which the
+# HIPPARCOS fetch must carry: without its Gaia matches, that fetch
+# would keep some 350 stars from beyond the edge, and every other check
+# would pass.
+REFERENCE_GAIA_MATCHES: dict[str, str] = {
+    "87937": "4472832130942575872",  # Barnard's Star
+    "57939": "4034171629042489088",  # Groombridge 1830
+    "24186": "4810594479418041856",  # Kapteyn's Star
 }

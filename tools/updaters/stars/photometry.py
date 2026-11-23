@@ -26,27 +26,42 @@ MAX_COLOUR_G_MAG = 19.0
 # dwarf sequence in Gaia's HR diagram ends at WHITE_DWARF_MAX_ABS_G_MAG.
 WHITE_DWARF_MAX_BP_RP = 1.0
 WHITE_DWARF_MIN_ABS_G_MAG = 10.0
-WHITE_DWARF_MAX_ABS_G_MAG = 16.0
+WHITE_DWARF_MAX_ABS_G_MAG = 16.5
+# Cool white dwarfs run on to this colour, at absolute G fainter than
+# COOL_WHITE_DWARF_MIN_ABS_G_MAG, where so does a distant star whose
+# parallax is spurious, so they are estimated only from a parallax of
+# at least STRONG_PARALLAX_SNR standard errors. Of 582 such rows in
+# Gaia DR3 within 160 ly, SIMBAD's object types (November 2026) count
+# 558 as white dwarfs; of 123 with weaker parallaxes, they count 2,
+# and SIMBAD does not know 111.
+COOL_WHITE_DWARF_MAX_BP_RP = 2.0
+COOL_WHITE_DWARF_MIN_ABS_G_MAG = 12.0
+STRONG_PARALLAX_SNR = 50
 # The reddest BP-RP colour of each main-sequence class, bluest first
-# (Pecaut and Mamajek 2013).
+# (Pecaut and Mamajek 2013). M has no red limit: Gaia measures late M
+# dwarfs at BP-RP 5 and redder, and magnitude tells the brown dwarfs
+# among them apart.
 _CLASS_MAX_BP_RP = (
     ("B", 0.0),
     ("A", 0.37),
     ("F", 0.77),
     ("G", 0.98),
     ("K", 1.84),
-    ("M", 5.0),
+    ("M", math.inf),
 )
 _RED_DWARF_MIN_BP_RP = dict(_CLASS_MAX_BP_RP)["K"]
 # The faintest red dwarf in Pecaut and Mamajek's table (version
 # 2022.04.16), M9.5V. Their brown dwarfs run on from 16.60 (L0V) to
 # 18.50 (L5V); T dwarfs, fainter still, are rarely seen by Gaia, whose
 # colours cannot tell the two apart, so an estimate calls both L.
+# Distant stars with spurious parallaxes land there too, so a brown
+# dwarf is estimated only from a parallax of at least
+# STRONG_PARALLAX_SNR standard errors, and a red star that faint with
+# a weaker one gets no estimate. Of 440 such red rows in Gaia DR3
+# within 160 ly with a strong parallax, SIMBAD's object types count 289
+# as brown dwarfs, and 19 carry an M type; of 1,536 with weaker
+# parallaxes, they count 160, and SIMBAD does not know 1,142.
 FAINTEST_RED_DWARF_ABS_G_MAG = 16.40
-# Red rows that faint with a parallax under this many standard errors
-# move across the sky at a median 2.6 km/s, as distant stars with
-# spurious parallaxes would, against 23 km/s for the rest.
-MIN_BROWN_DWARF_PARALLAX_SNR = 20
 
 # The absolute V magnitudes of each class's dwarfs, from the brightest
 # (earliest subtype) to the faintest (latest), from Pecaut and Mamajek
@@ -139,16 +154,18 @@ def estimate_spectral_class(
     type by its first letter, so estimates still group with their class
     in ``star_type_breakdown``.
 
-    A red star more than ``SPECTRAL_TYPE_MARGIN_MAG`` fainter in
-    absolute G than the faintest red dwarf is a brown dwarf, ``"L
-    (est)"``, when its parallax is at least
-    ``MIN_BROWN_DWARF_PARALLAX_SNR`` standard errors. That rests on the
-    magnitude, not the colour, so it holds at any G. Any other estimate
-    takes the star for a dwarf or a white dwarf, so there is none for a
-    star fainter than ``MAX_COLOUR_G_MAG``, one fainter than the white
-    dwarf sequence, or one whose absolute V magnitude is more than
+    A red star fainter in absolute G than the faintest red dwarf is a
+    brown dwarf, ``"L (est)"``, when its parallax is at least
+    ``STRONG_PARALLAX_SNR`` standard errors, and gets no estimate
+    otherwise. That rests on the magnitude, not the colour, so it holds
+    at any G. Any other estimate takes the star for a dwarf or a white
+    dwarf, so there is none for a star fainter than
+    ``MAX_COLOUR_G_MAG``, one fainter than the white dwarf sequence, or
+    one whose absolute V magnitude is more than
     ``SPECTRAL_TYPE_MARGIN_MAG`` outside the ``DWARF_ABS_V_MAG`` range
-    of the class its colour gives.
+    of the class its colour gives. A cool white dwarf, redder than
+    ``WHITE_DWARF_MAX_BP_RP``, also needs a parallax of
+    ``STRONG_PARALLAX_SNR`` standard errors.
 
     Returns:
         A class such as ``"M (est)"``, or ``""`` when there is no
@@ -157,16 +174,19 @@ def estimate_spectral_class(
     if bp_rp is None or gmag == MISSING_MAGNITUDE or dist_ly <= 0:
         return ""
     abs_g = absolute_magnitude(gmag, dist_ly)
-    if (
-        parallax_snr is not None
-        and parallax_snr >= MIN_BROWN_DWARF_PARALLAX_SNR
-        and bp_rp >= _RED_DWARF_MIN_BP_RP
-        and abs_g > FAINTEST_RED_DWARF_ABS_G_MAG + SPECTRAL_TYPE_MARGIN_MAG
-    ):
-        return "L (est)"
+    strong = parallax_snr is not None and parallax_snr >= STRONG_PARALLAX_SNR
+    if bp_rp >= _RED_DWARF_MIN_BP_RP and abs_g > FAINTEST_RED_DWARF_ABS_G_MAG:
+        return "L (est)" if strong else ""
     if gmag > MAX_COLOUR_G_MAG:
         return ""
-    if bp_rp < WHITE_DWARF_MAX_BP_RP and abs_g > WHITE_DWARF_MIN_ABS_G_MAG:
+    if abs_g > WHITE_DWARF_MIN_ABS_G_MAG and (
+        bp_rp < WHITE_DWARF_MAX_BP_RP
+        or (
+            strong
+            and bp_rp < COOL_WHITE_DWARF_MAX_BP_RP
+            and abs_g > COOL_WHITE_DWARF_MIN_ABS_G_MAG
+        )
+    ):
         return "D (est)" if abs_g <= WHITE_DWARF_MAX_ABS_G_MAG else ""
     letter = next(
         (letter for letter, max_bp_rp in _CLASS_MAX_BP_RP if bp_rp < max_bp_rp),

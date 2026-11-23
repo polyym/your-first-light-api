@@ -13,7 +13,10 @@ from tools.updaters.stars.astrometry import (
     min_parallax_mas,
     propagate_to_j2000,
 )
-from tools.updaters.stars.curated import GLIESE_COMMON_NAMES
+from tools.updaters.stars.curated import (
+    DUPLICATE_GLIESE_IDS,
+    GLIESE_COMMON_NAMES,
+)
 from tools.updaters.stars.entry import Star, catalogue_entry
 from tools.updaters.stars.vizier import (
     float_column,
@@ -61,7 +64,9 @@ def fetch_gliese(max_dist_ly: float) -> list[Star]:
 
     Positions are the catalogue's B1950 values converted to ICRS and
     propagated from epoch B1950.0 to J2000.0 with its total proper
-    motion and position angle.
+    motion and position angle. A component of a multiple system also
+    carries the system's designation in ``_gliese_system``. The rows in
+    ``DUPLICATE_GLIESE_IDS`` are left out.
 
     Returns:
         The entries, or an empty list when the query failed.
@@ -91,26 +96,25 @@ def fetch_gliese(max_dist_ly: float) -> list[Star]:
     stars = []
     for i, row in enumerate(table):
         distance_ly = row_distance_ly(row, "plx", "e_plx")
-        if distance_ly is None:
+        system = text_cell(row["Name"])
+        component = text_cell(row["Comp"])
+        designation = gliese_name(system, component)
+        if distance_ly is None or designation in DUPLICATE_GLIESE_IDS:
             continue
-        magnitude = magnitude_cell(row["Vmag"])
-        spectral_type = text_cell(row["Sp"])
-        designation = gliese_name(
-            text_cell(row["Name"]), text_cell(row["Comp"])
+        star = catalogue_entry(
+            name=GLIESE_COMMON_NAMES.get(designation, designation),
+            distance_ly=distance_ly,
+            spectral_type=text_cell(row["Sp"]),
+            magnitude=magnitude_cell(row["Vmag"]),
+            band="V",
+            ra_deg=ra_j2000[i],
+            dec_deg=dec_j2000[i],
+            source="gliese",
+            catalogue_id=designation,
         )
-        stars.append(
-            catalogue_entry(
-                name=GLIESE_COMMON_NAMES.get(designation, designation),
-                distance_ly=distance_ly,
-                spectral_type=spectral_type,
-                magnitude=magnitude,
-                band="V",
-                ra_deg=ra_j2000[i],
-                dec_deg=dec_j2000[i],
-                source="gliese",
-                catalogue_id=designation,
-            )
-        )
+        if component:
+            star["_gliese_system"] = system
+        stars.append(star)
 
     print(f"  Found {len(stars)} stars")
     return stars

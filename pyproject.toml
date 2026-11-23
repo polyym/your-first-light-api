@@ -1,6 +1,6 @@
 [project]
 name = "your-first-light"
-version = "1.0.0"
+version = "1.1.0"
 description = "Post your birthday. Discover your cosmic reach."
 requires-python = ">=3.13"
 # Exact versions live in uv.lock. numpy, pydantic, pyerfa and Starlette

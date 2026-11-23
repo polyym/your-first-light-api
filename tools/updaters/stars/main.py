@@ -18,6 +18,8 @@ from tools.updaters.stars.merge import (
     dedup_by_coordinates,
     dedup_by_name,
     merge_catalogues,
+    remove_beyond,
+    share_system_distances,
 )
 from tools.updaters.stars.photometry import (
     fix_spectral_types,
@@ -26,6 +28,7 @@ from tools.updaters.stars.photometry import (
 from tools.updaters.stars.validate import (
     MAX_RADIUS_LY,
     check_fetch_counts,
+    check_reference_matches,
     check_reference_positions,
     validate_catalogue,
 )
@@ -64,9 +67,11 @@ def main() -> None:
 def _fetch_catalogues() -> list[list[Star]]:
     """Fetches HIPPARCOS, Gliese and Gaia, in the order they merge.
 
-    A source that came back empty or thin, or with its reference stars
-    out of place, would give a catalogue that looks plausible while
-    missing thousands of stars or listing them twice, so the run stops.
+    A source that came back empty or thin, with its reference stars
+    out of place, or for HIPPARCOS without its Gaia DR3 matches, would
+    give a catalogue that looks plausible while missing thousands of
+    stars, listing them twice or keeping hundreds from beyond the edge,
+    so the run stops.
     """
     fetched = {
         "hipparcos": fetch_hipparcos(MAX_RADIUS_LY),
@@ -76,6 +81,7 @@ def _fetch_catalogues() -> list[list[Star]]:
     errors = check_fetch_counts({k: len(v) for k, v in fetched.items()})
     for source, stars in fetched.items():
         errors += check_reference_positions(stars, source)
+    errors += check_reference_matches(fetched["hipparcos"])
     if errors:
         _fail(errors, "fetch", _UPSTREAM_ADVICE)
     return list(fetched.values())
@@ -86,6 +92,10 @@ def _merge(*catalogues: list[Star]) -> list[Star]:
     print("\nMerging catalogues...")
     stars = merge_catalogues(*catalogues)
     print(f"  Merged to {len(stars)} unique stars")
+    shared = share_system_distances(stars)
+    print(f"  Gave {shared} Gliese components their system's distance")
+    beyond = remove_beyond(stars, MAX_RADIUS_LY)
+    print(f"  Removed {beyond} entries beyond {MAX_RADIUS_LY} ly")
 
     added, replaced = add_extra_stars(stars, EXTRA_STARS)
     print(f"  Added {added}, replaced {replaced} from EXTRA_STARS")

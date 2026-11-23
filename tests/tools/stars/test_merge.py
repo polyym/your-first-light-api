@@ -5,13 +5,16 @@ import random
 import pytest
 
 from tools.updaters.stars.merge import (
+    _pair_order,
     absorb,
     add_extra_stars,
     apply_overrides,
     dedup_by_coordinates,
     dedup_by_name,
     merge_catalogues,
+    remove_beyond,
     same_star,
+    share_system_distances,
 )
 from tools.updaters.stars.photometry import MISSING_MAGNITUDE
 from tools.updaters.stars.write import write_stars
@@ -926,3 +929,272 @@ def test_merged_entry_keeps_the_gaia_source_of_its_gaia_row(make_star):
 
     assert merged["name"] == "NN 3053"
     assert merged["_gaia_id"] == "2371032916186181760"
+
+
+def _with(star, **keys):
+    """An entry with merge bookkeeping keys added, such as _gaia_id."""
+    return star | {f"_{key}": value for key, value in keys.items()}
+
+
+def test_same_gaia_ids_merge_and_different_ones_never(make_star):
+    """A HIPPARCOS star joins only the Gaia row Gaia DR3 matched to it."""
+    hip = _with(
+        make_star(
+            "HIP 1",
+            50.0,
+            10.0,
+            10.0,
+            source="hipparcos",
+            pos_source="hipparcos",
+        ),
+        hip_id=1,
+        gaia_id="11",
+    )
+    own = _with(
+        make_star("Gaia DR3 11", 45.0, 10.0, 10.003, source="gaia"),
+        pos_source="gaia",
+        gaia_id="11",
+    )
+    other = _with(
+        make_star("Gaia DR3 12", 50.0, 10.0, 10.0, source="gaia"),
+        pos_source="gaia",
+        gaia_id="12",
+    )
+    # 10.8 arcsec apart, 10 per cent apart in distance.
+    assert same_star(hip, own)
+    # At the same place and distance.
+    assert not same_star(hip, other)
+
+
+def test_a_shared_gaia_id_joins_before_a_gliese_row_of_like_brightness(
+    make_star,
+):
+    """A Gliese component 2 arcsec from the Gaia row, within 0.05 mag.
+
+    Among like pairs at Gliese range it would join first and leave the
+    HIPPARCOS star, 8 arcsec away, without the Gaia row matched to it.
+    """
+    arcsec = 1 / 3600
+    hip = _with(
+        make_star(
+            "HIP 1",
+            47.0,
+            10.0,
+            10.0,
+            source="hipparcos",
+            pos_source="hipparcos",
+            mag=10.5,
+        ),
+        hip_id=1,
+        gaia_id="11",
+    )
+    gliese = [
+        make_star(
+            "Gl 1 A",
+            47.0,
+            10.0,
+            10.0,
+            source="gliese",
+            pos_source="gliese",
+            mag=10.5,
+        ),
+        make_star(
+            "Gl 1 B",
+            47.0,
+            10.0,
+            10.0 + 10 * arcsec,
+            source="gliese",
+            pos_source="gliese",
+            mag=10.2,
+        ),
+    ]
+    gaia = _with(
+        make_star(
+            "Gaia DR3 11",
+            44.3,
+            10.0,
+            10.0 + 8 * arcsec,
+            source="gaia",
+            mag=10.25,
+        ),
+        pos_source="gaia",
+        gaia_id="11",
+    )
+
+    merged = {s["name"]: s for s in merge_catalogues([hip], gliese, [gaia])}
+
+    assert set(merged) == {"HIP 1", "Gl 1 B"}
+    assert merged["HIP 1"]["distance_ly"] == 44.3
+    assert "_gaia_id" not in merged["Gl 1 B"]
+
+
+def test_gliese_rows_join_the_gaia_rows_of_like_brightness_first(make_star):
+    """NN 4288 A and B: B lies nearer A's Gaia row than A does.
+
+    Nearest first, B would take A's row and A would take B's.
+    """
+    arcsec = 1 / 3600
+    gliese = [
+        make_star(
+            "NN 1 A",
+            40.0,
+            10.0,
+            10.0,
+            source="gliese",
+            pos_source="gliese",
+            mag=12.0,
+        ),
+        make_star(
+            "NN 1 B",
+            40.0,
+            10.0,
+            10.0 + 10 * arcsec,
+            source="gliese",
+            pos_source="gliese",
+            mag=13.5,
+        ),
+    ]
+    gaia = [
+        make_star(
+            "Gaia DR3 A",
+            38.65,
+            10.0,
+            10.0 + 25 * arcsec,
+            source="gaia",
+            pos_source="gaia",
+            mag=12.0,
+        ),
+        make_star(
+            "Gaia DR3 B",
+            41.0,
+            10.0,
+            10.0 - 16 * arcsec,
+            source="gaia",
+            pos_source="gaia",
+            mag=13.5,
+        ),
+    ]
+
+    merged = {s["name"]: s for s in merge_catalogues(gliese, gaia)}
+
+    assert set(merged) == {"NN 1 A", "NN 1 B"}
+    assert merged["NN 1 A"]["distance_ly"] == 38.65
+    assert merged["NN 1 B"]["distance_ly"] == 41.0
+
+
+def test_absorbing_keeps_the_gliese_system(make_star):
+    hip = make_star("HIP 61941", 39.2, 190.4152, -1.4494, source="hipparcos")
+    gliese = _with(
+        make_star("Gl 482 A", 33.05, 190.4152, -1.4494, source="gliese"),
+        gliese_system="Gl 482",
+    )
+    absorb(hip, gliese)
+    assert hip["_gliese_system"] == "Gl 482"
+
+
+def test_gliese_component_takes_its_system_s_measured_distance(make_star):
+    """Gl 853 B, 39.6 ly by its Gliese parallax; Gl 853 A, 45.9 by Gaia."""
+    primary = _with(
+        make_star(
+            "HIP 110109", 45.8768, 334.5651, -53.6271, source="hipparcos"
+        ),
+        dist_source="gaia",
+        merged_sources={"hipparcos", "gliese", "gaia"},
+        gliese_system="Gl 853",
+    )
+    component = _with(
+        make_star("Gl 853 B", 39.582, 334.5665, -53.6267, source="gliese"),
+        gliese_system="Gl 853",
+    )
+    stars = [primary, component]
+
+    assert share_system_distances(stars) == 1
+
+    assert component["distance_ly"] == 45.8768
+    assert component["_dist_source"] == "gaia"
+
+
+def test_only_a_measured_component_gives_its_distance(make_star):
+    """Two components known only from the Gliese catalogue keep theirs."""
+    stars = [
+        _with(
+            make_star(f"Gl 9 {c}", dist, 10.0, 10.0, source="gliese"),
+            gliese_system="Gl 9",
+        )
+        for c, dist in (("A", 20.0), ("B", 22.0))
+    ]
+    assert share_system_distances(stars) == 0
+    assert [s["distance_ly"] for s in stars] == [20.0, 22.0]
+
+
+def test_nearest_measured_component_gives_the_distance(make_star):
+    stars = [
+        _with(
+            make_star(f"HIP {n}", dist, 10.0, dec, source="hipparcos"),
+            gliese_system="Gl 9",
+        )
+        for n, dist, dec in ((1, 30.0, 10.0), (2, 31.0, 10.5))
+    ] + [
+        _with(
+            make_star("Gl 9 C", 25.0, 10.0, 10.4, source="gliese"),
+            gliese_system="Gl 9",
+        )
+    ]
+    share_system_distances(stars)
+    assert stars[2]["distance_ly"] == 31.0
+
+
+def test_entries_beyond_the_radius_are_removed(make_star):
+    stars = [
+        make_star("HIP 1", 160.0, 10.0, 10.0),
+        make_star("HIP 2", 160.01, 20.0, 10.0),
+    ]
+    assert remove_beyond(stars, 160) == 1
+    assert [s["name"] for s in stars] == ["HIP 1"]
+
+
+@pytest.mark.parametrize(
+    ("row_mag", "sep_arcsec", "first"),
+    [
+        (12.5, 29.0, True),
+        (12.51, 29.0, False),
+        (12.0, 29.9, True),
+        (12.0, 30.0, False),
+    ],
+    ids=["0.5-mag", "0.51-mag", "29.9-arcsec", "30-arcsec"],
+)
+def test_like_pair_at_gliese_range_joins_before_the_rest(
+    make_star, row_mag, sep_arcsec, first
+):
+    gliese = make_star(
+        "NN 1", 40.0, 10.0, 10.0, source="gliese", pos_source="gliese", mag=12.0
+    )
+    gaia = make_star(
+        "Gaia DR3 1",
+        40.0,
+        10.0,
+        10.0 + sep_arcsec / 3600,
+        source="gaia",
+        pos_source="gaia",
+        mag=row_mag,
+    )
+    tier, _sep = _pair_order(gliese, gaia, sep_arcsec / 3600)
+    assert tier == (1 if first else 2)
+
+
+def test_like_pair_of_two_precise_positions_waits_its_turn(make_star):
+    """HIPPARCOS and Gaia positions agree to well under an arcsecond."""
+    hip = make_star(
+        "HIP 1", 40.0, 10.0, 10.0, source="hipparcos", pos_source="hipparcos"
+    )
+    gaia = make_star(
+        "Gaia DR3 1", 40.0, 10.0, 10.0, source="gaia", pos_source="gaia"
+    )
+    assert _pair_order(hip, gaia, 9 / 3600)[0] == 2
+
+
+@pytest.mark.parametrize("key", ["hip_id", "gaia_id"])
+def test_pair_sharing_an_id_joins_first(make_star, key):
+    entry = _with(make_star("HIP 1", 40.0, 10.0, 10.0), **{key: 7})
+    row = _with(make_star("Gaia DR3 7", 40.0, 10.0, 10.1), **{key: 7})
+    assert _pair_order(entry, row, 0.1) == (0, 0.1)

@@ -15,6 +15,7 @@ from tools.updaters.stars.validate import (
     DUPLICATE_DIST_TOL_FLOOR_LY,
     DUPLICATE_DIST_TOL_FRACTION,
     DUPLICATE_SEP_ARCSEC,
+    validate_catalogue,
 )
 
 ECLIPSES = json.loads((DATA_DIR / "eclipses.json").read_text(encoding="utf-8"))
@@ -116,6 +117,16 @@ def test_star_names_are_unique() -> None:
 
 def test_no_star_is_listed_twice_by_different_catalogues() -> None:
     assert _twins(NEARBY_STARS) == []
+
+
+def test_shipped_catalogue_passes_the_updaters_own_checks() -> None:
+    """The checks the updater runs before it writes the file.
+
+    A catalogue written by an older updater can pass every other test
+    here while breaking rules added since, such as the spectral types a
+    star's brightness rules out.
+    """
+    assert validate_catalogue([dict(star) for star in NEARBY_STARS]) == []
 
 
 @pytest.mark.parametrize(

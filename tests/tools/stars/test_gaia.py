@@ -1,8 +1,5 @@
 """Gaia DR3 from the ESA Gaia archive."""
 
-import sys
-import types
-
 import pytest
 from astropy.table import MaskedColumn, Table
 
@@ -77,48 +74,6 @@ def _archive_table() -> Table:
     table = Table({name: MaskedColumn(v) for name, v in _ROWS.items()})
     table["bp_rp"].mask = _NO_COLOUR
     return table
-
-
-class _Archive:
-    """The queries sent, and the answers to give: a table or an error.
-
-    A count query is answered with ``matching``, or by default with the
-    length of the table just sent.
-    """
-
-    def __init__(self) -> None:
-        self.queries: list[str] = []
-        self.count_queries: list[str] = []
-        self.answers: list[Table | Exception] = []
-        self.matching: int | None = None
-        self._sent = 0
-
-    def launch_job_async(self, adql: str) -> types.SimpleNamespace:
-        if adql.startswith("SELECT COUNT(*)"):
-            self.count_queries.append(adql)
-            matching = self._sent if self.matching is None else self.matching
-            counts = Table({"COUNT_ALL": [matching]})
-            return types.SimpleNamespace(get_results=lambda: counts)
-        self.queries.append(adql)
-        queue = self.answers
-        answer = queue.pop(0) if len(queue) > 1 else queue[0]
-        if isinstance(answer, Exception):
-            raise answer
-        self._sent = len(answer)
-        return types.SimpleNamespace(get_results=lambda: answer)
-
-
-@pytest.fixture
-def archive(monkeypatch: pytest.MonkeyPatch) -> _Archive:
-    """Stands astroquery's Gaia in for the ESA Gaia archive."""
-    gaia = _Archive()
-    module = types.ModuleType("astroquery.gaia")
-    module.Gaia = gaia
-    monkeypatch.setitem(
-        sys.modules, "astroquery", types.ModuleType("astroquery")
-    )
-    monkeypatch.setitem(sys.modules, "astroquery.gaia", module)
-    return gaia
 
 
 def test_query_takes_every_star_inside_160_ly_in_a_fixed_order():

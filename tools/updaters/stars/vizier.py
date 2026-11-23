@@ -17,8 +17,8 @@ from tools.updaters.stars.astrometry import parallax_to_ly
 from tools.updaters.stars.photometry import MISSING_MAGNITUDE
 
 # The CDS primary first, then the mirror at the Center for Astrophysics,
-# which holds HIPPARCOS and Gliese in full, so a CDS outage need not
-# fail the refresh.
+# which holds Gliese in full, so a CDS outage need not fail the
+# refresh.
 VIZIER_HOSTS = ("vizier.cds.unistra.fr", "vizier.cfa.harvard.edu")
 # astroquery's row_limit for "every matching row".
 NO_ROW_LIMIT = -1
@@ -42,10 +42,10 @@ def query_catalogue(
     warnings it gives are printed, since they say why.
 
     Args:
-        label: The source's name in warnings, such as ``"HIPPARCOS"``.
-        catalogue: The VizieR identifier, such as ``"I/239/hip_main"``.
+        label: The source's name in warnings, such as ``"Gliese"``.
+        catalogue: The VizieR identifier, such as ``"V/70A/catalog"``.
         columns: The VizieR column names to return.
-        **constraints: Column constraints, such as ``Plx=">20.38475"``.
+        **constraints: Column constraints, such as ``plx=">20.38475"``.
 
     Returns:
         The astropy table of matching rows, or ``None`` after printing

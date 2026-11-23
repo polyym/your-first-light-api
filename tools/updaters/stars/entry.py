@@ -12,7 +12,10 @@ bookkeeping keys (leading underscore) that only the updater reads:
   it, in merge order.
 - ``_catalogue_id``: the identifier in its own catalogue.
 - ``_hip_id``: its HIPPARCOS number, when it has one.
-- ``_gaia_id``: its Gaia DR3 source ID, when it has one.
+- ``_gaia_id``: its Gaia DR3 source ID, when it has one. A HIPPARCOS
+  entry carries the one Gaia DR3 matched to it.
+- ``_gliese_system``: the Gliese designation of the multiple system it
+  is a component of, such as ``"Gl 559"``.
 - ``_catalogue_ra``, ``_catalogue_dec``: where the catalogues put it
   before an override replaced the position.
 """

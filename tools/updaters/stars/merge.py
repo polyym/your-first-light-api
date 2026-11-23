@@ -39,9 +39,14 @@ never applies between two positions from HIPPARCOS or Gaia.
 No tier joins two entries more than MERGE_MAX_MAG_DIFF apart in
 magnitude: they are two stars, such as a bright star with no Gaia row
 of its own and a faint star beside it.
+
+Before any tier, a HIPPARCOS star that Gaia DR3 has matched joins only
+that Gaia row (see hipparcos.fetch_hipparcos), and such pairs join
+first.
 """
 
 from bisect import bisect_left, bisect_right
+from collections import defaultdict
 
 from tools.updaters.stars.astrometry import ARCSEC_PER_DEG, angular_sep_deg
 from tools.updaters.stars.curated import KNOWN_STAR_OVERRIDES
@@ -75,9 +80,8 @@ MERGE_DIST_TOL_FLOOR_LY = 1.0
 # chance pair), and in most such pairs one row has a nearer match,
 # which the merge takes first. Not in all: where both components of
 # an equal binary lie this far from their Gliese places, the nearest
-# pair can be the wrong one. GJ 1141 A and B, and GJ 3999 and GJ
-# 4000, each take the other's Gaia row, up to 30 arcsec and 0.4
-# light-years from their own.
+# pair can be the wrong one: NN 3999 A and NN 4000 B each take the
+# other's Gaia row, 0.4 light-years from their own.
 TWIN_MAX_MAG_DIFF = 0.2
 TWIN_MAX_SEP_ARCSEC = 180.0
 
@@ -85,6 +89,13 @@ TWIN_MAX_SEP_ARCSEC = 180.0
 # this, a hundredfold in flux: even the reddest dwarfs the G to V
 # relation covers have a G only 3.6 mag brighter than their V.
 MERGE_MAX_MAG_DIFF = 5.0
+# Within the Gliese catalogue's position errors, the nearer of two
+# close rows is often the wrong star: NN 4288 B lies nearer the Gaia
+# row of NN 4288 A than A does. Magnitude tells them apart, so among
+# pairs within GLIESE_COINCIDENT_SEP_ARCSEC that involve a Gliese
+# position, those whose V magnitudes agree within LIKE_MAG_DIFF join
+# first.
+LIKE_MAG_DIFF = 0.5
 
 # Two entries with the same common name are one star unless the
 # catalogues put them this far apart.
@@ -114,7 +125,8 @@ def same_star(a: Star, b: Star) -> bool:
 
     The rules, in order:
 
-    - Two entries with HIP numbers match only when the numbers do.
+    - Two entries with HIP numbers match only when the numbers do, and
+      two with Gaia DR3 source IDs only when the IDs do.
     - Entries whose sources overlap never match: two rows of one
       catalogue are two objects, such as a resolved binary.
     - Two common names match when they are equal and close on the
@@ -126,6 +138,10 @@ def same_star(a: Star, b: Star) -> bool:
     hip_b: int | None = b.get("_hip_id")
     if hip_a and hip_b:
         return hip_a == hip_b
+    gaia_a: str | None = a.get("_gaia_id")
+    gaia_b: str | None = b.get("_gaia_id")
+    if gaia_a and gaia_b:
+        return gaia_a == gaia_b
 
     if sources_of(a) & sources_of(b):
         return False
@@ -197,13 +213,14 @@ def absorb(existing: Star, star: Star) -> None:
 
     Keeps the common name over a designation, a V-band magnitude over a
     G-band one and any magnitude over none, the higher exoplanet count
-    and any HIP number or Gaia source ID. Each catalogue's spectral
-    type is kept, in merge order, in ``_spectral_types``, for
-    ``photometry.fix_spectral_types`` to choose from once the distance
-    is final. The distance and position come from the most reliable
-    catalogue (Gaia, then HIPPARCOS, then Gliese): the best parallax
-    comes with the best astrometry, and a merged entry must not keep a
-    Gliese position quantised to a second of time.
+    and any HIP number, Gaia source ID or Gliese system. Each
+    catalogue's spectral type is kept, in merge order, in
+    ``_spectral_types``, for ``photometry.fix_spectral_types`` to choose
+    from once the distance is final. The distance and position come
+    from the most reliable catalogue (Gaia, then HIPPARCOS, then
+    Gliese): the best parallax comes with the best astrometry, and a
+    merged entry must not keep a Gliese position quantised to a second
+    of time.
     """
     if is_catalogue_id(existing["name"]) and not is_catalogue_id(star["name"]):
         existing["name"] = star["name"]
@@ -217,6 +234,8 @@ def absorb(existing: Star, star: Star) -> None:
         existing["_hip_id"] = star["_hip_id"]
     if not existing.get("_gaia_id") and star.get("_gaia_id"):
         existing["_gaia_id"] = star["_gaia_id"]
+    if not existing.get("_gliese_system") and star.get("_gliese_system"):
+        existing["_gliese_system"] = star["_gliese_system"]
     if existing.get("ra_deg") is None and star.get("ra_deg") is not None:
         existing["ra_deg"] = star["ra_deg"]
         existing["dec_deg"] = star["dec_deg"]
@@ -261,10 +280,12 @@ def merge_catalogues(*catalogues: list[Star]) -> list[Star]:
     the entry it is nearest rather than whichever entry it reaches
     first, so a bright star's own Gaia row is not left over as a second
     entry because a faint companion's row came earlier, and binary
-    components pair with the right counterparts. Rows are taken in
-    catalogue ID order, so the result does not depend on the order an
-    upstream service returned them in. Earlier catalogues win names and
-    magnitudes.
+    components pair with the right counterparts. Pairs that share a
+    HIP number or Gaia source ID go first, and within the Gliese
+    catalogue's position errors so do pairs of like magnitude
+    (``LIKE_MAG_DIFF``). Rows are taken in catalogue ID order, so the
+    result does not depend on the order an upstream service returned
+    them in. Earlier catalogues win names and magnitudes.
 
     Returns:
         The merged entries. The given entries are left unchanged.
@@ -274,7 +295,7 @@ def merge_catalogues(*catalogues: list[Star]) -> list[Star]:
         rows = sorted(catalogue, key=_row_order)
         absorbed: set[int] = set()
         matched: set[int] = set()
-        for _sep, i, j in sorted(_candidate_pairs(merged, rows)):
+        for _order, i, j in sorted(_candidate_pairs(merged, rows)):
             if i in absorbed or j in matched:
                 continue
             absorb(merged[i], rows[j])
@@ -300,12 +321,13 @@ def _row_order(star: Star) -> tuple[str, str, float, float]:
 
 def _candidate_pairs(
     merged: list[Star], rows: list[Star]
-) -> list[tuple[float, int, int]]:
+) -> list[tuple[tuple[int, float], int, int]]:
     """Every pair of a merged entry and a row that may be one star.
 
     Returns:
-        ``(separation_deg, merged_index, row_index)`` for each pair
-        ``same_star`` accepts.
+        ``(order, merged_index, row_index)`` for each pair
+        ``same_star`` accepts, where sorting by ``order``
+        (``_pair_order``) puts the pairs to join first in front.
     """
     # A declination gap is a lower bound on the separation, so a window
     # in declination rules most entries out before any trigonometry.
@@ -333,8 +355,93 @@ def _candidate_pairs(
                     row.get("ra_deg"),
                     dec,
                 )
-                pairs.append((sep, i, j))
+                pairs.append((_pair_order(merged[i], row, sep), i, j))
     return pairs
+
+
+def _pair_order(entry: Star, row: Star, sep_deg: float) -> tuple[int, float]:
+    """The sort key of a candidate pair: shared ID, like magnitudes, nearest.
+
+    A pair that shares a HIP number or Gaia source ID comes first. Next
+    come pairs where one position is not HIPPARCOS or Gaia astrometry,
+    the two lie within ``GLIESE_COINCIDENT_SEP_ARCSEC`` and their V
+    magnitudes agree within ``LIKE_MAG_DIFF``. Then the rest, each
+    group nearest first.
+    """
+    if any(
+        entry.get(key) and entry.get(key) == row.get(key)
+        for key in ("_hip_id", "_gaia_id")
+    ):
+        return (0, sep_deg)
+    like = (
+        not (has_precise_position(entry) and has_precise_position(row))
+        and sep_deg < GLIESE_COINCIDENT_SEP_ARCSEC / ARCSEC_PER_DEG
+        and entry.get("magnitude_band") == row.get("magnitude_band") == "V"
+        and MISSING_MAGNITUDE
+        not in (entry["apparent_magnitude"], row["apparent_magnitude"])
+        and round(
+            abs(entry["apparent_magnitude"] - row["apparent_magnitude"]),
+            MAGNITUDE_DECIMALS,
+        )
+        <= LIKE_MAG_DIFF
+    )
+    return (1 if like else 2, sep_deg)
+
+
+def share_system_distances(stars: list[Star]) -> int:
+    """Gives Gliese-only components their system's measured distance.
+
+    The Gliese catalogue lists each component of a resolved multiple
+    star, and the parallax of a faint one is often a photometric
+    estimate. Where another component of the same system merged with a
+    HIPPARCOS or Gaia row, that measured distance is the system's, and
+    an entry drawn from the Gliese catalogue alone takes it: Gl 853 B
+    would otherwise sit 39.6 light-years away to its primary's 45.9,
+    and SIMBAD puts it at 44.7. With several such components, the
+    nearest on the sky gives the distance. Works in place, after
+    ``merge_catalogues``.
+
+    Returns:
+        The number of entries given a distance.
+    """
+    measured: defaultdict[str, list[Star]] = defaultdict(list)
+    for s in stars:
+        system = s.get("_gliese_system")
+        if system and _distance_quality(s) > SOURCE_QUALITY["gliese"]:
+            measured[system].append(s)
+    changed = 0
+    for s in stars:
+        siblings = measured.get(s.get("_gliese_system") or "")
+        if sources_of(s) != {"gliese"} or not siblings:
+            continue
+        sibling = min(
+            siblings,
+            key=lambda m: angular_sep_deg(
+                s.get("ra_deg"),
+                s.get("dec_deg"),
+                m.get("ra_deg"),
+                m.get("dec_deg"),
+            ),
+        )
+        s["distance_ly"] = sibling["distance_ly"]
+        s["_dist_source"] = _distance_source(sibling)
+        changed += 1
+    return changed
+
+
+def remove_beyond(stars: list[Star], max_dist_ly: float) -> int:
+    """Drops the entries further away than ``max_dist_ly``, in place.
+
+    HIPPARCOS stars near the edge are fetched for their Gaia rows to
+    place, and those that stay beyond it go here, with any Gliese
+    component that took their distance.
+
+    Returns:
+        The number of entries dropped.
+    """
+    before = len(stars)
+    stars[:] = [s for s in stars if s["distance_ly"] <= max_dist_ly]
+    return before - len(stars)
 
 
 def add_extra_stars(stars: list[Star], extras: list[Star]) -> tuple[int, int]:

@@ -51,6 +51,18 @@ MAX_RUWE = 1.4
 MIN_PARALLAX_SNR_AT_HIGH_RUWE = 20
 
 
+def reliable_parallax(ruwe: float, parallax_snr: float) -> bool:
+    """Whether a Gaia parallax passes the RUWE rule.
+
+    It does when the solution fits (RUWE at most ``MAX_RUWE``) or the
+    parallax is at least ``MIN_PARALLAX_SNR_AT_HIGH_RUWE`` standard
+    errors. A value missing as NaN counts against the row.
+    """
+    # NaN fails every comparison, so each test passes only a value
+    # that is there.
+    return ruwe <= MAX_RUWE or parallax_snr >= MIN_PARALLAX_SNR_AT_HIGH_RUWE
+
+
 def archive_query(min_parallax: float) -> str:
     """The ADQL for every Gaia DR3 source with a larger parallax in mas.
 
@@ -94,8 +106,11 @@ def fetch_gaia(max_dist_ly: float) -> list[Star]:
     """
     min_parallax = min_parallax_mas(max_dist_ly)
     print(f"[3/4] Querying Gaia DR3 (parallax > {min_parallax} mas)...")
-    table = _query_archive(
-        archive_query(min_parallax), archive_count_query(min_parallax)
+    table = query_archive(
+        "Gaia",
+        archive_query(min_parallax),
+        archive_count_query(min_parallax),
+        "source_id",
     )
     if table is None:
         return []
@@ -110,9 +125,8 @@ def fetch_gaia(max_dist_ly: float) -> list[Star]:
     )
     bp_rp_col = float_column(table, "bp_rp")
     # Gaia gives every source with a parallax a RUWE and a parallax
-    # error. One that came without would read as NaN, which fails
-    # every comparison, so the test below is written to pass only
-    # values that are there.
+    # error. One that came without reads as NaN, which counts against
+    # the row.
     ruwe_col = float_column(table, "ruwe")
     snr_col = float_column(table, "parallax") / float_column(
         table, "parallax_error"
@@ -120,10 +134,7 @@ def fetch_gaia(max_dist_ly: float) -> list[Star]:
     stars = []
     unreliable = 0
     for i, row in enumerate(table):
-        if (
-            not ruwe_col[i] <= MAX_RUWE
-            and not snr_col[i] >= MIN_PARALLAX_SNR_AT_HIGH_RUWE
-        ):
+        if not reliable_parallax(ruwe_col[i], snr_col[i]):
             unreliable += 1
             continue
         distance_ly = row_distance_ly(row, "parallax", "parallax_error")
@@ -132,7 +143,10 @@ def fetch_gaia(max_dist_ly: float) -> list[Star]:
         gmag = magnitude_cell(row["phot_g_mean_mag"])
         bp_rp = float(bp_rp_col[i]) if np.isfinite(bp_rp_col[i]) else None
         spectral_type = estimate_spectral_class(
-            bp_rp, gmag, distance_ly, parallax_snr=float(snr_col[i])
+            bp_rp,
+            gmag,
+            distance_ly,
+            parallax_snr=float(snr_col[i]),
         )
         source_id = str(row["source_id"])
         v_est = gaia_g_to_v(gmag, bp_rp) if gmag != MISSING_MAGNITUDE else None
@@ -158,13 +172,16 @@ def fetch_gaia(max_dist_ly: float) -> list[Star]:
     return stars
 
 
-def _query_archive(adql: str, count_adql: str) -> Any | None:
+def query_archive(
+    label: str, adql: str, count_adql: str, key: str
+) -> Any | None:
     """Runs an ADQL query on the ESA Gaia archive, with retries.
 
     The archive can end an answer early without saying so, so each
     answer is checked against the archive's own count of matching rows
-    and for repeated rows, and one that fails either check is retried
-    like any other failure.
+    and for repeated values of the ``key`` column, which names one row,
+    and one that fails either check is retried like any other failure.
+    ``label`` names the catalogue in warnings, such as ``"Gaia"``.
 
     Returns:
         The astropy table of results, or ``None`` after printing a
@@ -182,18 +199,18 @@ def _query_archive(adql: str, count_adql: str) -> Any | None:
             raise IncompleteAnswerError(
                 f"the archive sent {len(table)} of {matching} matching rows"
             )
-        if len(set(table["source_id"])) != len(table):
+        if len(set(table[key])) != len(table):
             raise IncompleteAnswerError("the archive sent repeated rows")
         return table
 
     try:
-        table = with_retries(complete_answer, "Gaia archive query")
+        table = with_retries(complete_answer, f"{label} archive query")
     except Exception as e:
         # Any failure, from DNS to a failed job, means the same: the
         # archive returned nothing usable.
-        print(f"  WARNING: Gaia archive query failed: {e}")
+        print(f"  WARNING: {label} archive query failed: {e}")
         return None
     if not len(table):
-        print("  WARNING: No Gaia results")
+        print(f"  WARNING: No {label} results")
         return None
     return table

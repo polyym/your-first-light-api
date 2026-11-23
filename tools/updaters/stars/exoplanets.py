@@ -28,6 +28,9 @@ def fetch_exoplanet_counts() -> dict[str, int]:
         failed. The fetch guard then fails the run. A HIP number
         without its component letter counts the planets of every host
         that shares it, since HIPPARCOS lists such a pair as one star.
+        So does the Gaia DR3 source of such a pair when the archive
+        gives one to only one of its hosts: Gaia did not resolve them
+        either (HD 41004 A and B, half an arcsecond apart).
     """
     # astroquery is only in the catalogue dependency group; importing it
     # here lets the rest of the updater, and its tests, run without it.
@@ -51,6 +54,7 @@ def fetch_exoplanet_counts() -> dict[str, int]:
     planets: Counter[str] = Counter()
     other_names: defaultdict[str, set[str]] = defaultdict(set)
     hosts_by_hip_number: defaultdict[str, set[str]] = defaultdict(set)
+    gaia_sources: dict[str, str] = {}
     for row in table:
         hostname = _name_cell(row["hostname"])
         planets[hostname] += 1
@@ -58,18 +62,21 @@ def fetch_exoplanet_counts() -> dict[str, int]:
         if hip:
             hip_number = hip.replace("HIP", "").strip().split()[0]
             hosts_by_hip_number[f"HIP {hip_number}"].add(hostname)
-        other_names[hostname] |= {
-            hip,
-            _name_cell(row["hd_name"]),
-            _name_cell(row["gaia_dr3_id"]),
-        }
+        gaia = _name_cell(row["gaia_dr3_id"])
+        if gaia:
+            gaia_sources[hostname] = gaia
+        other_names[hostname] |= {hip, _name_cell(row["hd_name"]), gaia}
 
     counts: dict[str, int] = {}
     for hostname, pnum in planets.items():
         for name in {hostname, *other_names[hostname]}:
             _keep_max(counts, name, pnum)
     for hip_key, hostnames in hosts_by_hip_number.items():
-        _keep_max(counts, hip_key, sum(planets[h] for h in hostnames))
+        pair_planets = sum(planets[h] for h in hostnames)
+        _keep_max(counts, hip_key, pair_planets)
+        sourced = [h for h in hostnames if h in gaia_sources]
+        if len(hostnames) > 1 and len(sourced) == 1:
+            _keep_max(counts, gaia_sources[sourced[0]], pair_planets)
 
     print(f"  Found exoplanet data for {len(counts)} keys")
     return counts
