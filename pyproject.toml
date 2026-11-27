@@ -7,7 +7,7 @@ requires-python = ">=3.13"
 # come in through astropy and fastapi too, but the app imports them
 # directly.
 dependencies = [
-    "fastapi>=0.162.5,<0.163.0",
+    "fastapi>=0.162.5,<0.166.0",
     "uvicorn>=0.54.0,<0.55.0",
     "astropy>=8.0.2,<8.1.0",
     "numpy>=2.5.1,<3",
